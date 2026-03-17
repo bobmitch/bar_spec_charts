@@ -1,7 +1,7 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.1 by FilthyMitch
+    v2.2 by FilthyMitch
 
     History window : exactly 60 in-game seconds = 1 800 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
@@ -18,6 +18,24 @@
       myTeamID is set to nil for spectators — build-efficiency sampling and
       unit-event army-tracking are bypassed (no "my" units exist).
       Default viewed team is the first non-Gaia team found.
+
+    Active-team filtering (v2.2 fix):
+      isActiveParticipant(tid) is now the sole gate for admitting a team into
+      allyTeams.  It passes iff the team slot:
+        (a) is an AI team, OR
+        (b) has a human leader who is NOT spectating and IS active, OR
+        (c) has no leader but already has units (handles edge-case late joins).
+      This prevents spectator-occupied team slots from being tracked, which was
+      the root cause of incorrect/missing view-switch data in v2.1.
+
+      resolveTeamName now also reads the spectator flag from GetPlayerInfo so
+      the displayed name is always the in-game player name, not the slot number.
+
+    View-switch correctness (v2.2 fix):
+      switchView() now calls rebuildMultiTeamSeries() on both ally charts to
+      refresh their series pointers whenever the team roster may have changed,
+      and always sets chromeDirty = true.  Previously the multi-team series
+      could point at stale teamIDs after the viewed player left/resigned.
 
     Architecture notes (FBO / shader feasibility):
       Spring's Lua GL is immediate-mode only — no VBO, no UBO, no GLSL upload,
@@ -131,7 +149,7 @@ local isSpectator  = false
 
 -- allTeams table — named allyTeams for code compatibility.
 -- In player mode: only ally-group teams.
--- In spectator mode: every active game team.
+-- In spectator mode: every ACTIVE game team (spectator slots excluded).
 local allyTeams = {}
 
 -- ── Ring buffers ─────────────────────────────────────────────────────────────
@@ -1029,18 +1047,66 @@ end
 -- ALLY TEAM INIT
 -------------------------------------------------------------------------------
 
+-- FIX v2.2: isActiveParticipant — the single gate for admitting a team slot.
+--
+-- A team is an active participant if it is:
+--   (a) an AI-controlled team, OR
+--   (b) led by a human player who is NOT spectating and IS currently active
+--       (i.e. not disconnected/resigned), OR
+--   (c) has no valid leader but already has live units on the map.
+--
+-- This correctly excludes:
+--   • Gaia team (no leader, no AI, no units at game start)
+--   • Observer/spectator-occupied team slots (leader is a spectator)
+--   • Empty/dead team slots that somehow survived GetTeamList
+--
+-- Spring.GetPlayerInfo returns: name, active, spectator, teamID, allyTeamID, ...
+-- We only need `active` (ret[2]) and `spectator` (ret[3]).
+local function isActiveParticipant(tid)
+    local _, leaderID, isDead, isAI = Spring.GetTeamInfo(tid)
+
+    -- Skip teams that have already resigned/died.
+    -- Note: isDead can be nil for some engine versions; treat nil as false.
+    if isDead then return false end
+
+    -- AI teams are always legitimate participants.
+    if isAI then return true end
+
+    -- Human-led team: check the leader is a real, non-spectating player.
+    if leaderID and leaderID >= 0 then
+        local name, active, spectator = Spring.GetPlayerInfo(leaderID)
+        -- `active` is true while the player is connected (not resigned/dropped).
+        -- `spectator` is true for observers who happen to hold a team slot ID.
+        if name and active and not spectator then
+            return true
+        end
+        -- Fall through: leader exists but is spectating or disconnected.
+        -- Still allow the team if it has units (handles AI take-over / late joins).
+        local units = Spring.GetTeamUnits(tid)
+        return units and #units > 0
+    end
+
+    -- No valid leader — allow only if there are already units (shouldn't happen
+    -- in normal BAR games but guards against edge cases).
+    local units = Spring.GetTeamUnits(tid)
+    return units and #units > 0
+end
+
 -- Build the display name for a team slot.
+-- FIX v2.2: reads name from GetPlayerInfo rather than just playerID so the
+-- returned string is always the in-game player name, not a slot number.
 local function resolveTeamName(tid)
-    local name = "Team "..tid
     local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
     if isAI then
         local _, aiName = Spring.GetAIInfo(tid)
-        name = aiName or name
-    elseif leaderID then
-        local pName = Spring.GetPlayerInfo(leaderID)
-        name = pName or name
+        return aiName or ("AI "..tid)
     end
-    return name
+    if leaderID and leaderID >= 0 then
+        -- GetPlayerInfo: name, active, spectator, teamID, ...
+        local pName = Spring.GetPlayerInfo(leaderID)
+        if pName and pName ~= "" then return pName end
+    end
+    return "Team "..tid
 end
 
 local function initAllyTeams()
@@ -1050,10 +1116,9 @@ local function initAllyTeams()
 
     local tlist
     if isSpectator then
-        -- Spectators can see all teams.  Spring.GetTeamList() with no argument
-        -- returns every team slot in the game including Gaia (usually slot 0
-        -- with no units in BAR).  We filter out Gaia by checking for a valid
-        -- leader or AI and having at least one unit.
+        -- Spectators enumerate every team slot.
+        -- isActiveParticipant() will filter out Gaia, empty slots, and
+        -- spectator-occupied slots below.
         tlist = Spring.GetTeamList()
     else
         local aid = Spring.GetMyAllyTeamID()
@@ -1064,13 +1129,14 @@ local function initAllyTeams()
 
     if not tlist or #tlist == 0 then return false end
 
+    -- FIX v2.2: use isActiveParticipant() as the sole admission gate.
+    -- The old heuristic (isAI or leaderID >= 0 or units > 0) was too broad —
+    -- it admitted spectator-occupied team slots because leaderID >= 0 is true
+    -- for any player, including pure spectators who hold slot 0 etc.
     local newTeams = {}
     local firstTID = nil
     for _, tid in ipairs(tlist) do
-        -- Skip Gaia team: it has no leader, no AI, and no normal units.
-        local _, leaderID, isDead, isAI, side, allyID = Spring.GetTeamInfo(tid)
-        local units = Spring.GetTeamUnits(tid)
-        if isAI or (leaderID and leaderID >= 0) or (units and #units > 0) then
+        if isActiveParticipant(tid) then
             local r, g, b = Spring.GetTeamColor(tid)
             newTeams[tid] = {
                 teamID          = tid,
@@ -1095,10 +1161,13 @@ local function initAllyTeams()
 
     -- Set default viewed team.
     if isSpectator then
-        -- Default to first non-Gaia team found.
+        -- Default to first active non-Gaia team found.
         viewedTeamID = firstTID
     else
-        viewedTeamID = myTeamID
+        -- Stay on myTeamID if it was already valid.
+        -- myTeamID may be nil only if this is a pure spectator path
+        -- (shouldn't reach here in that case, but guard anyway).
+        viewedTeamID = (myTeamID and newTeams[myTeamID]) and myTeamID or firstTID
     end
 
     return true
@@ -1303,7 +1372,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.0",
+        version           = "2.2",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         charts            = {},
@@ -1375,15 +1444,22 @@ end
 -- PLAYER VIEW SWITCHING
 -------------------------------------------------------------------------------
 
--- Switches the displayed player.  O(1): just updates viewedTeamID and the
--- multiTeam series pointers (chrome rebuild sets the name strip).
+-- Switches the displayed player.  O(1) pointer swap + multi-team series refresh.
+-- FIX v2.2: now also refreshes multiTeam series so they never point at stale
+-- teamIDs, and always marks chrome dirty so the name-strip updates immediately.
 local function switchView(targetTeamID)
     if not allyTeams[targetTeamID] then
         Spring.Echo("BAR Charts: Unknown team ID "..tostring(targetTeamID))
         return
     end
     viewedTeamID = targetTeamID
-    chromeDirty  = true
+
+    -- Refresh multi-team series in case the roster changed since last init.
+    if charts.allyArmy       then charts.allyArmy:rebuildMultiTeamSeries()       end
+    if charts.allyBuildPower then charts.allyBuildPower:rebuildMultiTeamSeries() end
+
+    chromeDirty = true
+
     local vStats = allyTeams[viewedTeamID]
     Spring.Echo("BAR Charts: Now viewing "
         ..(vStats and vStats.playerName or tostring(targetTeamID)))
@@ -1405,7 +1481,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2: Initialize")
+    Spring.Echo("BAR Charts v2.2: Initialize")
     vsx, vsy     = Spring.GetViewGeometry()
 
     -- Detect spectator status up-front.
@@ -1428,7 +1504,9 @@ function widget:Initialize()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
     chromeDirty = true
-    Spring.Echo("BAR Charts v2: Initialized" .. (isSpectator and " (SPECTATOR — all teams)" or "") .. ", waiting for team data…")
+    Spring.Echo("BAR Charts v2.2: Initialized"
+        .. (isSpectator and " (SPECTATOR — active teams only)" or "")
+        .. ", waiting for team data…")
 end
 
 -------------------------------------------------------------------------------
@@ -1468,7 +1546,8 @@ function widget:GameFrame(n)
                 chromeDirty  = true
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
-                Spring.Echo(string.format("BAR Charts v2: Ready — %s, buffering %d teams",
+                Spring.Echo(string.format(
+                    "BAR Charts v2.2: Ready — %s, buffering %d active participant team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
             end
         end
@@ -1508,7 +1587,7 @@ function widget:GameStart()
         stats.metalStall  = 0; stats.totalBP   = 0
     end
     chromeDirty = true
-    Spring.Echo("BAR Charts v2: Game started")
+    Spring.Echo("BAR Charts v2.2: Game started")
 end
 
 -------------------------------------------------------------------------------
@@ -1655,12 +1734,13 @@ function widget:TextCommand(command)
                 if found then
                     switchView(found)
                 else
-                    Spring.Echo("BAR Charts: No team matching '"..arg.."'")
+                    Spring.Echo("BAR Charts: No active team matching '"..arg.."'")
                 end
             end
         else
-            -- List available teams
-            Spring.Echo("BAR Charts: Tracked teams" .. (isSpectator and " (spectator — all teams)" or " (allies)") .. ":")
+            -- List available active teams
+            Spring.Echo("BAR Charts: Active participant teams"
+                .. (isSpectator and " (spectator — all active teams)" or " (allies)") .. ":")
             for tid, stats in pairs(allyTeams) do
                 local marker = (tid == viewedTeamID) and " ◀ viewing" or ""
                 local mine   = (myTeamID and tid == myTeamID) and " (you)" or ""
@@ -1679,14 +1759,14 @@ function widget:TextCommand(command)
     elseif command == "barcharts edit" then
         onToggleClick(nil); return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2 Debug ===")
+        Spring.Echo("=== BAR Charts v2.2 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
         Spring.Echo(string.format("isSpectator=%s  myTeamID=%s  viewedTeamID=%s",
             tostring(isSpectator), tostring(myTeamID), tostring(viewedTeamID)))
-        Spring.Echo("-- TRACKED TEAMS --")
+        Spring.Echo("-- ACTIVE PARTICIPANT TEAMS --")
         for tid, stats in pairs(allyTeams) do
             local full = history[tid] and histFull[tid] and histFull[tid]["metalIncome"] or false
             local head = history[tid] and histHead[tid] and histHead[tid]["metalIncome"] or 0
@@ -1722,6 +1802,7 @@ function widget:TextCommand(command)
                 key, count, table.concat(vals, ", ")))
         end
         return true
+    elseif command == "barcharts bp" then
         Spring.Echo("=== Builder Efficiency Diagnostic ===")
         local stats = allyTeams[myTeamID]
         Spring.Echo(string.format("  Rolling avg: %.1f%%  (samples %d/%d)",
@@ -1760,5 +1841,5 @@ function widget:Shutdown()
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2: Shutdown")
+    Spring.Echo("BAR Charts v2.2: Shutdown")
 end
