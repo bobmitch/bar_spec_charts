@@ -1111,40 +1111,66 @@ end
 local function collectStats(gameFrame)
     frameCounter = frameCounter + 1
 
-    -- ── Per-frame: cheap resource read for every ally team ────────────────
+    -- ── Per-second: heavier queries first so values are current when pushed ──
+    if frameCounter >= FULL_SCAN_INTERVAL then
+        frameCounter = 0
+        for tid, stats in pairs(allyTeams) do
+            if Spring.GetTeamDamageStats then
+                local dd, dt = Spring.GetTeamDamageStats(tid)
+                stats.damageDealt = dd or stats.damageDealt
+                stats.damageTaken = dt or stats.damageTaken
+            end
+            local uK, uD = Spring.GetTeamUnitStats(tid)
+            if uK then stats.kills  = uK end
+            if uD then stats.losses = uD end
+        end
+    end
+
+    -- ── Per-frame: resource reads ─────────────────────────────────────────
+    -- Spring.GetTeamResources returns valid data for:
+    --   • Your own team always
+    --   • All teams in your ally group (shared resource vision)
+    --   • ALL teams when spectating
+    -- For enemy teams in player mode it returns nil — we push the last known
+    -- value (already in stats.*) so the line stays flat rather than zeroing.
     for tid, stats in pairs(allyTeams) do
         local ml, ms, mpull, minc, mexp = Spring.GetTeamResources(tid, "metal")
         local el, es, epull, einc, eexp = Spring.GetTeamResources(tid, "energy")
-        stats.metalIncome  = minc or 0
-        stats.metalUsage   = mexp or 0
-        stats.energyIncome = einc or 0
-        stats.energyUsage  = eexp or 0
 
-        -- Metal stall detection (per team, but only meaningful for viewed player)
-        local pull   = mpull or 0
-        local expense = mexp or 0
-        if pull > 1 then
-            local ratio = expense / pull
-            if     ratio < 0.60 then stats.metalStall = 2
-            elseif ratio < 0.98 then stats.metalStall = 1
-            else                     stats.metalStall = 0 end
-        else
-            stats.metalStall = 0
+        -- Only update if we actually got data (non-nil income means the call succeeded)
+        if minc ~= nil then
+            stats.metalIncome  = minc
+            stats.metalUsage   = mexp or 0
+            stats.energyIncome = einc or 0
+            stats.energyUsage  = eexp or 0
+
+            -- Metal stall detection
+            local pull    = mpull or 0
+            local expense = mexp  or 0
+            if pull > 1 then
+                local ratio = expense / pull
+                if     ratio < 0.60 then stats.metalStall = 2
+                elseif ratio < 0.98 then stats.metalStall = 1
+                else                     stats.metalStall = 0 end
+            else
+                stats.metalStall = 0
+            end
         end
+        -- If minc is nil (enemy team in player mode), stats.* keep their last
+        -- value — the ring buffer gets a repeated sample rather than a zero spike.
 
-        -- Push samples into ring buffers for this team
+        -- Push all series for this team every frame
         if history[tid] then
-            ringPush(tid, "metalIncome",  stats.metalIncome)
-            ringPush(tid, "metalUsage",   stats.metalUsage)
-            ringPush(tid, "energyIncome", stats.energyIncome)
-            ringPush(tid, "energyUsage",  stats.energyUsage)
-            ringPush(tid, "armyValue",    stats.armyValue)
-            ringPush(tid, "buildPower",   stats.buildPower)
-            -- These are per-second but we still push every frame (value just unchanged)
-            ringPush(tid, "kills",        stats.kills)
-            ringPush(tid, "losses",       stats.losses)
-            ringPush(tid, "damageDealt",  stats.damageDealt)
-            ringPush(tid, "damageTaken",  stats.damageTaken)
+            ringPush(tid, "metalIncome",     stats.metalIncome)
+            ringPush(tid, "metalUsage",      stats.metalUsage)
+            ringPush(tid, "energyIncome",    stats.energyIncome)
+            ringPush(tid, "energyUsage",     stats.energyUsage)
+            ringPush(tid, "armyValue",       stats.armyValue)
+            ringPush(tid, "buildPower",      stats.buildPower)
+            ringPush(tid, "kills",           stats.kills)
+            ringPush(tid, "losses",          stats.losses)
+            ringPush(tid, "damageDealt",     stats.damageDealt)
+            ringPush(tid, "damageTaken",     stats.damageTaken)
             ringPush(tid, "buildEfficiency", stats.buildEfficiency)
         end
     end
@@ -1155,21 +1181,6 @@ local function collectStats(gameFrame)
         for _, bd in pairs(builderUnits) do totalBP = totalBP + bd.bp end
         local mts = allyTeams[myTeamID]
         if mts then mts.totalBP = totalBP end
-    end
-
-    -- ── Per-second: heavier queries ───────────────────────────────────────
-    if frameCounter >= FULL_SCAN_INTERVAL then
-        frameCounter = 0
-        for tid, stats in pairs(allyTeams) do
-            if Spring.GetTeamDamageStats then
-                local dd, dt = Spring.GetTeamDamageStats(tid)
-                stats.damageDealt = dd or 0
-                stats.damageTaken = dt or 0
-            end
-            local uK, uD = Spring.GetTeamUnitStats(tid)
-            if uK then stats.kills  = uK end
-            if uD then stats.losses = uD end
-        end
     end
 
     -- ── Update displayed stat-card values (viewed team) ───────────────────
@@ -1687,7 +1698,30 @@ function widget:TextCommand(command)
                 stats.armyValue, tostring(full), head))
         end
         return true
-    elseif command == "barcharts bp" then
+    elseif command == "barcharts viewdebug" then
+        -- Dumps the last 5 sample values from each series for the currently
+        -- viewed team so you can verify the ring buffer is actually switching.
+        local tid = viewedTeamID
+        local stats = allyTeams[tid]
+        Spring.Echo(string.format("=== ViewDebug: team %s (%s) ===",
+            tostring(tid), stats and stats.playerName or "?"))
+        if not history[tid] then
+            Spring.Echo("  ERROR: no ring buffer for this team!")
+            return true
+        end
+        for _, key in ipairs(SERIES_KEYS) do
+            local startIdx, count = ringRange(tid, key)
+            -- Read last 5 values
+            local vals = {}
+            local buf  = history[tid][key]
+            for i = math.max(1, count-4), count do
+                local idx = ((startIdx - 1 + (i-1)) % HISTORY_SIZE) + 1
+                vals[#vals+1] = string.format("%.1f", buf[idx] or 0)
+            end
+            Spring.Echo(string.format("  %-20s  count=%d  last5: %s",
+                key, count, table.concat(vals, ", ")))
+        end
+        return true
         Spring.Echo("=== Builder Efficiency Diagnostic ===")
         local stats = allyTeams[myTeamID]
         Spring.Echo(string.format("  Rolling avg: %.1f%%  (samples %d/%d)",
