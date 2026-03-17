@@ -49,7 +49,7 @@
 
 function widget:GetInfo()
     return {
-        name      = "BAR Stats Charts",
+        name      = "BAR Spec Charts",
         desc      = "Real-time resource and combat statistics overlay — 1-min ring buffer, multi-team view",
         author    = "FilthyMitch",
         date      = "2026",
