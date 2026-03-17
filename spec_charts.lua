@@ -1,15 +1,23 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.0 by FilthyMitch
+    v2.1 by FilthyMitch
 
     History window : exactly 60 in-game seconds = 1 800 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
     Rendering      : chrome (bg/grid/labels) in a display list, rebuilt only
                      on structural changes; line geometry drawn raw every
                      DrawScreen call — always current regardless of GPU fps
-    Player switch  : all ally teams are buffered simultaneously; switching
-                     view is an O(1) pointer swap (no copy, no gap)
+    Player switch  : ALL teams buffered simultaneously (player and spectator);
+                     switching view is an O(1) pointer swap (no copy, no gap)
+
+    Spectator mode :
+      Detected via Spring.GetSpectatingState() at init and re-checked each
+      ready-wait cycle.  In spectator mode Spring.GetTeamList() is called with
+      no argument to enumerate ALL active game teams (not just one ally group).
+      myTeamID is set to nil for spectators — build-efficiency sampling and
+      unit-event army-tracking are bypassed (no "my" units exist).
+      Default viewed team is the first non-Gaia team found.
 
     Architecture notes (FBO / shader feasibility):
       Spring's Lua GL is immediate-mode only — no VBO, no UBO, no GLSL upload,
@@ -115,14 +123,15 @@ local chartsInteractive = false   -- locked by default
 
 -- The team whose data the charts currently display.
 local viewedTeamID = nil
--- The local player's team (never changes mid-game).
+-- The local player's team.  nil when spectating (no "my" units exist).
 local myTeamID     = nil
 local myAllyTeamID = nil
+-- True when the local client is a spectator.
+local isSpectator  = false
 
--- allyTeams[teamID] = { playerName, color, metalIncome, energyIncome,
---                        armyValue, buildPower, kills, losses,
---                        damageDealt, damageTaken, unitCount, metalLost,
---                        buildEfficiency, metalStall, totalBP }
+-- allTeams table — named allyTeams for code compatibility.
+-- In player mode: only ally-group teams.
+-- In spectator mode: every active game team.
 local allyTeams = {}
 
 -- ── Ring buffers ─────────────────────────────────────────────────────────────
@@ -936,7 +945,8 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
         ts.armyValue  = ts.armyValue  + cost
         if bp > 0 then ts.buildPower = ts.buildPower + bp end
     end
-    if unitTeam == myTeamID then
+    -- Builder tracking only relevant when we have a local team.
+    if myTeamID and unitTeam == myTeamID then
         local mts = allyTeams[myTeamID]
         if mts then mts.unitCount = mts.unitCount + 1 end
         if bp > 0 then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
@@ -952,7 +962,7 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
         ts.armyValue = math.max(0, ts.armyValue - cost)
         if bp > 0 then ts.buildPower = math.max(0, ts.buildPower - bp) end
     end
-    if unitTeam == myTeamID then
+    if myTeamID and unitTeam == myTeamID then
         local mts = allyTeams[myTeamID]
         if mts then
             mts.unitCount = math.max(0, mts.unitCount - 1)
@@ -976,15 +986,17 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
         nts.armyValue = nts.armyValue + cost
         if bp > 0 then nts.buildPower = nts.buildPower + bp end
     end
-    if oldTeam == myTeamID then
-        local mts = allyTeams[myTeamID]
-        if mts then mts.unitCount = math.max(0, mts.unitCount - 1) end
-        builderUnits[unitID] = nil
-    end
-    if newTeam == myTeamID then
-        local mts = allyTeams[myTeamID]
-        if mts then mts.unitCount = mts.unitCount + 1 end
-        if bp > 0 then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
+    if myTeamID then
+        if oldTeam == myTeamID then
+            local mts = allyTeams[myTeamID]
+            if mts then mts.unitCount = math.max(0, mts.unitCount - 1) end
+            builderUnits[unitID] = nil
+        end
+        if newTeam == myTeamID then
+            local mts = allyTeams[myTeamID]
+            if mts then mts.unitCount = mts.unitCount + 1 end
+            if bp > 0 then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
+        end
     end
 end
 
@@ -996,40 +1008,78 @@ end
 -- ALLY TEAM INIT
 -------------------------------------------------------------------------------
 
-local function initAllyTeams()
-    local aid = Spring.GetMyAllyTeamID()
-    if not aid then return false end
-    local tlist = Spring.GetTeamList(aid)
-    if not tlist or #tlist == 0 then return false end
-    myAllyTeamID = aid
-    local newAllyTeams = {}
-    for _, tid in ipairs(tlist) do
-        local r, g, b        = Spring.GetTeamColor(tid)
-        local playerName     = "Team "..tid
-        local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
-        if isAI then
-            local _, name = Spring.GetAIInfo(tid)
-            playerName = name or playerName
-        elseif leaderID then
-            local name = Spring.GetPlayerInfo(leaderID)
-            playerName = name or playerName
-        end
-        newAllyTeams[tid] = {
-            teamID        = tid,
-            playerName    = playerName,
-            color         = {r or 1, g or 1, b or 1, 1},
-            metalIncome   = 0, metalUsage    = 0,
-            energyIncome  = 0, energyUsage   = 0,
-            damageDealt   = 0, damageTaken   = 0,
-            armyValue     = 0, buildPower    = 0,
-            kills         = 0, losses        = 0,
-            unitCount     = 0, metalLost     = 0,
-            buildEfficiency = 0,
-            metalStall    = 0, totalBP       = 0,
-        }
-        initTeamBuffers(tid)
+-- Build the display name for a team slot.
+local function resolveTeamName(tid)
+    local name = "Team "..tid
+    local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
+    if isAI then
+        local _, aiName = Spring.GetAIInfo(tid)
+        name = aiName or name
+    elseif leaderID then
+        local pName = Spring.GetPlayerInfo(leaderID)
+        name = pName or name
     end
-    allyTeams = newAllyTeams
+    return name
+end
+
+local function initAllyTeams()
+    -- Detect spectator status fresh each call (player may have joined mid-game).
+    local spec, fullSpec = Spring.GetSpectatingState()
+    isSpectator = spec or false
+
+    local tlist
+    if isSpectator then
+        -- Spectators can see all teams.  Spring.GetTeamList() with no argument
+        -- returns every team slot in the game including Gaia (usually slot 0
+        -- with no units in BAR).  We filter out Gaia by checking for a valid
+        -- leader or AI and having at least one unit.
+        tlist = Spring.GetTeamList()
+    else
+        local aid = Spring.GetMyAllyTeamID()
+        if not aid then return false end
+        tlist = Spring.GetTeamList(aid)
+        myAllyTeamID = aid
+    end
+
+    if not tlist or #tlist == 0 then return false end
+
+    local newTeams = {}
+    local firstTID = nil
+    for _, tid in ipairs(tlist) do
+        -- Skip Gaia team: it has no leader, no AI, and no normal units.
+        local _, leaderID, isDead, isAI, side, allyID = Spring.GetTeamInfo(tid)
+        local units = Spring.GetTeamUnits(tid)
+        if isAI or (leaderID and leaderID >= 0) or (units and #units > 0) then
+            local r, g, b = Spring.GetTeamColor(tid)
+            newTeams[tid] = {
+                teamID          = tid,
+                playerName      = resolveTeamName(tid),
+                color           = {r or 1, g or 1, b or 1, 1},
+                metalIncome     = 0, metalUsage      = 0,
+                energyIncome    = 0, energyUsage     = 0,
+                damageDealt     = 0, damageTaken     = 0,
+                armyValue       = 0, buildPower      = 0,
+                kills           = 0, losses          = 0,
+                unitCount       = 0, metalLost       = 0,
+                buildEfficiency = 0,
+                metalStall      = 0, totalBP         = 0,
+            }
+            initTeamBuffers(tid)
+            if not firstTID then firstTID = tid end
+        end
+    end
+
+    if not next(newTeams) then return false end
+    allyTeams = newTeams
+
+    -- Set default viewed team.
+    if isSpectator then
+        -- Default to first non-Gaia team found.
+        viewedTeamID = firstTID
+    else
+        viewedTeamID = myTeamID
+    end
+
     return true
 end
 
@@ -1078,11 +1128,13 @@ local function collectStats(gameFrame)
         end
     end
 
-    -- Build power total for my team
-    local totalBP = 0
-    for _, bd in pairs(builderUnits) do totalBP = totalBP + bd.bp end
-    local mts = allyTeams[myTeamID]
-    if mts then mts.totalBP = totalBP end
+    -- Build power total — only meaningful when we have a local team.
+    if myTeamID then
+        local totalBP = 0
+        for _, bd in pairs(builderUnits) do totalBP = totalBP + bd.bp end
+        local mts = allyTeams[myTeamID]
+        if mts then mts.totalBP = totalBP end
+    end
 
     -- ── Per-second: heavier queries ───────────────────────────────────────
     if frameCounter >= FULL_SCAN_INTERVAL then
@@ -1321,8 +1373,13 @@ end
 function widget:Initialize()
     Spring.Echo("BAR Charts v2: Initialize")
     vsx, vsy     = Spring.GetViewGeometry()
-    myTeamID     = Spring.GetMyTeamID()
-    viewedTeamID = myTeamID
+
+    -- Detect spectator status up-front.
+    local spec = Spring.GetSpectatingState()
+    isSpectator = spec or false
+    myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
+    viewedTeamID = myTeamID   -- nil for spectators until initAllyTeams resolves
+
     chartsReady  = false
     frameCounter = 0
     chartsReadyWaitFrames = 0
@@ -1337,7 +1394,7 @@ function widget:Initialize()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
     chromeDirty = true
-    Spring.Echo("BAR Charts v2: Initialized, waiting for team data…")
+    Spring.Echo("BAR Charts v2: Initialized" .. (isSpectator and " (SPECTATOR — all teams)" or "") .. ", waiting for team data…")
 end
 
 -------------------------------------------------------------------------------
@@ -1357,29 +1414,38 @@ function widget:GameFrame(n)
         chartsReadyWaitFrames = chartsReadyWaitFrames + 1
         if chartsReadyWaitFrames >= READY_WAIT_FRAMES then
             chartsReadyWaitFrames = 0
-            myTeamID = myTeamID or Spring.GetMyTeamID()
+            -- Re-check spectator status each cycle (player may have joined).
+            local spec = Spring.GetSpectatingState()
+            isSpectator = spec or false
+            myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
+
             if initAllyTeams() then
-                viewedTeamID = myTeamID
                 charts.allyArmy:rebuildMultiTeamSeries()
                 charts.allyBuildPower:rebuildMultiTeamSeries()
                 seedArmyValues()
-                seedBuildPower()
-                seedUnitCount()
+                if not isSpectator then
+                    seedBuildPower()
+                    seedUnitCount()
+                end
                 chartsReady  = true
                 frameCounter = 0
                 chromeDirty  = true
-                Spring.Echo("BAR Charts v2: Ready — buffering all "
-                    ..tostring(#Spring.GetTeamList(myAllyTeamID)).." ally teams")
+                local teamCount = 0
+                for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
+                Spring.Echo(string.format("BAR Charts v2: Ready — %s, buffering %d teams",
+                    isSpectator and "SPECTATOR" or "player", teamCount))
             end
         end
         return
     end
 
-    -- Build efficiency sampler
-    buildEffTickCounter = buildEffTickCounter + 1
-    if buildEffTickCounter >= BUILD_EFF_TICKS_PER_SAMPLE then
-        buildEffTickCounter = 0
-        pushBuildEffSample(sampleBuildEfficiency())
+    -- Build efficiency sampler — only useful when we have a local team.
+    if myTeamID then
+        buildEffTickCounter = buildEffTickCounter + 1
+        if buildEffTickCounter >= BUILD_EFF_TICKS_PER_SAMPLE then
+            buildEffTickCounter = 0
+            pushBuildEffSample(sampleBuildEfficiency())
+        end
     end
 
     collectStats(n)
@@ -1558,10 +1624,10 @@ function widget:TextCommand(command)
             end
         else
             -- List available teams
-            Spring.Echo("BAR Charts: Allied teams:")
+            Spring.Echo("BAR Charts: Tracked teams" .. (isSpectator and " (spectator — all teams)" or " (allies)") .. ":")
             for tid, stats in pairs(allyTeams) do
-                local marker = (tid == viewedTeamID) and " ◀ (viewing)" or ""
-                local mine   = (tid == myTeamID)    and " (you)" or ""
+                local marker = (tid == viewedTeamID) and " ◀ viewing" or ""
+                local mine   = (myTeamID and tid == myTeamID) and " (you)" or ""
                 Spring.Echo(string.format("  %d  %s%s%s", tid, stats.playerName, mine, marker))
             end
         end
@@ -1582,13 +1648,16 @@ function widget:TextCommand(command)
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
-        Spring.Echo(string.format("myTeamID=%s  viewedTeamID=%s", tostring(myTeamID), tostring(viewedTeamID)))
-        Spring.Echo("-- ALLY TEAMS --")
+        Spring.Echo(string.format("isSpectator=%s  myTeamID=%s  viewedTeamID=%s",
+            tostring(isSpectator), tostring(myTeamID), tostring(viewedTeamID)))
+        Spring.Echo("-- TRACKED TEAMS --")
         for tid, stats in pairs(allyTeams) do
             local full = history[tid] and histFull[tid] and histFull[tid]["metalIncome"] or false
             local head = history[tid] and histHead[tid] and histHead[tid]["metalIncome"] or 0
-            Spring.Echo(string.format("  [%d] %s  metal=%.0f/%.0f  army=%.0f  full=%s head=%d",
-                tid, stats.playerName,
+            local viewing = (tid == viewedTeamID) and " ◀" or ""
+            local mine    = (tid == myTeamID)     and " (you)" or ""
+            Spring.Echo(string.format("  [%d] %s%s%s  metal=%.0f/%.0f  army=%.0f  full=%s head=%d",
+                tid, stats.playerName, mine, viewing,
                 stats.metalIncome, stats.metalUsage,
                 stats.armyValue, tostring(full), head))
         end
