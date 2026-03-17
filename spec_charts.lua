@@ -604,7 +604,8 @@ local function rebuildChromeList()
                     gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
                     gl.PopMatrix()
                 else
-                    -- Compute axis range from current data
+                    -- Compute axis range from current data (explicit loop — table.unpack
+                    -- hits Lua's stack limit with 150+ values)
                     local allV = {}
                     for i = 1, #chart.series do
                         local pts = chart:getSamples(i)
@@ -614,8 +615,12 @@ local function rebuildChromeList()
                     end
                     local minV, maxV
                     if #allV > 0 then
-                        minV = math.min(table.unpack(allV))
-                        maxV = math.max(table.unpack(allV))
+                        minV = allV[1]; maxV = allV[1]
+                        for j = 2, #allV do
+                            local v = allV[j]
+                            if v < minV then minV = v end
+                            if v > maxV then maxV = v end
+                        end
                     else
                         minV, maxV = 0, 100
                     end
@@ -670,29 +675,10 @@ local function rebuildChromeList()
                     -- Chart title
                     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4]*am)
                     gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
-
-                    -- Stall indicator on build-eff chart
-                    if chart.id == "chart-build-efficiency" and chart.enabled then
-                        local vStats = allyTeams[viewedTeamID]
-                        local stall  = vStats and vStats.metalStall or 0
-                        if stall == 2 then
-                            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0*am)
-                            gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
-                        elseif stall == 1 then
-                            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0*am)
-                            gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
-                        end
-                    end
-
-                    -- Viewed-player name strip (only if not own team)
-                    if viewedTeamID ~= myTeamID then
-                        local vStats = allyTeams[viewedTeamID]
-                        if vStats then
-                            local tc = vStats.color
-                            gl.Color(tc[1], tc[2], tc[3], 0.9*am)
-                            gl.Text("▶ "..vStats.playerName, w/2, h-pad.top-10, 9, "co")
-                        end
-                    end
+                    -- NOTE: stall indicator and viewed-player name are NOT drawn here.
+                    -- They reference viewedTeamID which changes on view-switches but the
+                    -- display list bakes values at compile time.  They are drawn raw in
+                    -- drawChartLines() instead, where viewedTeamID is always current.
 
                     gl.PopMatrix()
                 end
@@ -744,18 +730,19 @@ end
 -------------------------------------------------------------------------------
 
 local function computeRange(chart)
-    -- Re-reads current ring buffer to get live min/max (lightweight).
-    local allV = {}
+    -- Re-reads current ring buffer to get live min/max.
+    -- Uses an explicit loop — table.unpack hits Lua's stack limit with 150+ values.
+    local mn, mx
     for i = 1, #chart.series do
         local pts = chart:getSamples(i)
         for _, v in ipairs(pts) do
-            if v and not (v ~= v) then allV[#allV+1] = v end
+            if v and not (v ~= v) then
+                if mn == nil or v < mn then mn = v end
+                if mx == nil or v > mx then mx = v end
+            end
         end
     end
-    if #allV == 0 then return nil end
-
-    local mn = math.min(table.unpack(allV))
-    local mx = math.max(table.unpack(allV))
+    if mn == nil then return nil end
 
     if chart.chartType == "percent" then
         mn = 0; mx = 100
@@ -852,6 +839,40 @@ local function drawChartLines(chart)
                 gl.Text(vTxt, cX+cW+2, toY(last)-4+lOff, 9, "o")
             end
         end
+    end
+
+    gl.PopMatrix()
+
+    -- ── Per-view overlays drawn raw (viewedTeamID must be live) ──────────
+    -- These cannot live in the chrome display list because gl.CreateList
+    -- bakes GL commands at compile time — viewedTeamID would be stale.
+    local pad = PADDING
+    local w   = chart.width
+    local h   = chart.height
+    local vStats = allyTeams[viewedTeamID]
+
+    gl.PushMatrix()
+    gl.Translate(chart.x, chart.y, 0)
+    gl.Scale(chart.scale, chart.scale, 1)
+
+    -- Stall indicator (build-efficiency chart only)
+    if chart.id == "chart-build-efficiency" then
+        local stall = vStats and vStats.metalStall or 0
+        if stall == 2 then
+            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+            gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
+        elseif stall == 1 then
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+            gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
+        end
+    end
+
+    -- Viewed-player name strip when not watching own team
+    -- (always shown for spectators since myTeamID is nil)
+    if viewedTeamID ~= myTeamID and vStats then
+        local tc = vStats.color
+        gl.Color(tc[1], tc[2], tc[3], 0.9)
+        gl.Text("▶ "..vStats.playerName, w/2, h-pad.top-10, 9, "co")
     end
 
     gl.PopMatrix()
@@ -1153,10 +1174,12 @@ local function collectStats(gameFrame)
 
     -- ── Update displayed stat-card values (viewed team) ───────────────────
     for _, card in pairs(statCards) do card:update() end
-
-    -- Chrome axis labels depend on data range, mark dirty every frame
-    -- (cheap: just flips a bool; actual rebuild is throttled to Update)
-    chromeDirty = true
+    -- NOTE: do NOT set chromeDirty here.  Chrome must only be rebuilt on
+    -- structural changes (drag, resize, enable/disable, view switch, viewport
+    -- resize).  Setting it every frame deletes+rebuilds the display list 30×/s
+    -- and was the direct cause of the observed flicker.  Data-range scaling for
+    -- the grid labels is recomputed live in computeRange() every DrawScreen call
+    -- without touching the display list, so the grid always reflects current data.
 end
 
 -------------------------------------------------------------------------------
@@ -1398,11 +1421,13 @@ function widget:Initialize()
 end
 
 -------------------------------------------------------------------------------
--- UPDATE (wall-clock — only rebuilds chrome if flagged)
+-- UPDATE (wall-clock — nothing to do; chrome rebuilds happen in DrawScreen)
 -------------------------------------------------------------------------------
 
 function widget:Update(dt)
-    if chromeDirty then rebuildChromeList() end
+    -- Intentionally empty.  Chrome is rebuilt at the top of DrawScreen when
+    -- chromeDirty is true.  Rebuilding here AND in DrawScreen caused the list
+    -- to be deleted and re-created twice in the same render frame.
 end
 
 -------------------------------------------------------------------------------
