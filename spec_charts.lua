@@ -1000,9 +1000,10 @@ local function seedBuildPower()
 end
 
 local function seedUnitCount()
-    local units = Spring.GetTeamUnits(myTeamID) or {}
-    local stats = allyTeams[myTeamID]
-    if stats then stats.unitCount = #units end
+    for tid in pairs(allyTeams) do
+        local units = Spring.GetTeamUnits(tid) or {}
+        allyTeams[tid].unitCount = #units
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -1624,10 +1625,8 @@ function widget:GameFrame(n)
                 charts.allyArmy:rebuildMultiTeamSeries()
                 charts.allyBuildPower:rebuildMultiTeamSeries()
                 seedArmyValues()
-                if not isSpectator then
-                    seedBuildPower()
-                    seedUnitCount()
-                end
+                seedBuildPower()    -- seeds builderUnits[tid] for every tracked team
+                seedUnitCount()     -- seeds unitCount for every tracked team
                 chartsReady  = true
                 frameCounter = 0
                 chromeDirty  = true
