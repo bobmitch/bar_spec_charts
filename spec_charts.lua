@@ -840,16 +840,19 @@ local function drawChartLines(chart)
             local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
                              and toY(0) or cY
 
-            -- Filled area
-            gl.Color(clr[1], clr[2], clr[3], 0.15*am)
-            gl.BeginEnd(GL.TRIANGLE_STRIP, function()
-                for i, v in ipairs(pts) do
-                    if v and not (v ~= v) then
-                        local x = cX + ((i-1)/(nPts-1)) * cW
-                        gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
+            -- Filled area — skipped for multi-team charts where overlapping
+            -- fills from several series make the chart unreadable.
+            if chart.chartType ~= "multi" then
+                gl.Color(clr[1], clr[2], clr[3], 0.15*am)
+                gl.BeginEnd(GL.TRIANGLE_STRIP, function()
+                    for i, v in ipairs(pts) do
+                        if v and not (v ~= v) then
+                            local x = cX + ((i-1)/(nPts-1)) * cW
+                            gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
+                        end
                     end
-                end
-            end)
+                end)
+            end
 
             -- Line
             gl.Color(clr[1], clr[2], clr[3], 1.0*am)
