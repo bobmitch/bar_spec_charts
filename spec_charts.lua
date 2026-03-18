@@ -1449,9 +1449,21 @@ end
 -- teamIDs, and always marks chrome dirty so the name-strip updates immediately.
 local function switchView(targetTeamID)
     if not allyTeams[targetTeamID] then
-        Spring.Echo("BAR Charts: Unknown team ID "..tostring(targetTeamID))
+        Spring.Echo("BAR Charts: switchView FAILED — teamID "
+            ..tostring(targetTeamID).." not in tracked set")
+        Spring.Echo("BAR Charts: Tracked teams are:")
+        for tid, stats in pairs(allyTeams) do
+            Spring.Echo(string.format("  teamID=%-3d  '%s'", tid, stats.playerName))
+        end
         return
     end
+
+    local oldStats = allyTeams[viewedTeamID]
+    Spring.Echo(string.format(
+        "BAR Charts: switchView  %s (team %d) → %s (team %d)",
+        oldStats and oldStats.playerName or tostring(viewedTeamID), viewedTeamID or -1,
+        allyTeams[targetTeamID].playerName, targetTeamID))
+
     viewedTeamID = targetTeamID
 
     -- Refresh multi-team series in case the roster changed since last init.
@@ -1460,9 +1472,9 @@ local function switchView(targetTeamID)
 
     chromeDirty = true
 
-    local vStats = allyTeams[viewedTeamID]
-    Spring.Echo("BAR Charts: Now viewing "
-        ..(vStats and vStats.playerName or tostring(targetTeamID)))
+    Spring.Echo(string.format(
+        "BAR Charts: viewedTeamID is now %d ('%s')  chromeDirty=true",
+        viewedTeamID, allyTeams[viewedTeamID].playerName))
 end
 
 -- Look up team by player name (case-insensitive partial match).
@@ -1510,13 +1522,66 @@ function widget:Initialize()
 end
 
 -------------------------------------------------------------------------------
--- UPDATE (wall-clock — nothing to do; chrome rebuilds happen in DrawScreen)
+-- UPDATE (wall-clock tick — spectator camera follow)
 -------------------------------------------------------------------------------
 
+-- pollLocalTeam: called every Update() tick.
+--
+-- Spring.GetSpectatingState() returns: bool spectating, bool fullView, bool fullSelect
+-- There is NO spectatedPlayerID in the return — that signature does not exist
+-- in the Recoil/BAR engine build.
+--
+-- The correct primitive is Spring.GetLocalTeamID(), which maps to gu->myTeam
+-- in the engine.  For a spectator in BAR this value updates immediately when
+-- you click a player name in the player list, so polling it every Update()
+-- tick gives us instant view-switch detection with no extra API calls.
+local function pollLocalTeam()
+    if not chartsReady then return end
+
+    local teamID = Spring.GetLocalTeamID()
+    if teamID == nil then return end
+    if teamID == viewedTeamID then return end   -- no change, common case
+
+    -- Log the raw engine value on every transition.
+    Spring.Echo(string.format(
+        "BAR Charts [poll] GetLocalTeamID=%d  (current viewedTeamID=%s)",
+        teamID, tostring(viewedTeamID)))
+
+    if not allyTeams[teamID] then
+        -- Not in our tracked set.  Can happen if the engine returns a Gaia or
+        -- spectator-slot teamID, or if the ready-wait cycle hasn't run yet.
+        Spring.Echo(string.format(
+            "BAR Charts [poll] teamID=%d NOT in tracked set — ignoring (tracked: %s)",
+            teamID,
+            (function()
+                local ids = {}
+                for tid in pairs(allyTeams) do ids[#ids+1] = tostring(tid) end
+                table.sort(ids)
+                return table.concat(ids, ", ")
+            end)()))
+        return
+    end
+
+    local oldStats = allyTeams[viewedTeamID]
+    Spring.Echo(string.format(
+        "BAR Charts [poll] VIEW SWITCH  '%s' (team %s) → '%s' (team %d)",
+        oldStats and oldStats.playerName or tostring(viewedTeamID),
+        tostring(viewedTeamID),
+        allyTeams[teamID].playerName, teamID))
+
+    viewedTeamID = teamID
+    chromeDirty  = true
+
+    Spring.Echo(string.format(
+        "BAR Charts [poll] viewedTeamID is now %d ('%s')  chromeDirty=true",
+        viewedTeamID, allyTeams[viewedTeamID].playerName))
+end
+
 function widget:Update(dt)
-    -- Intentionally empty.  Chrome is rebuilt at the top of DrawScreen when
-    -- chromeDirty is true.  Rebuilding here AND in DrawScreen caused the list
-    -- to be deleted and re-created twice in the same render frame.
+    pollLocalTeam()
+    -- Chrome is rebuilt at the top of DrawScreen when chromeDirty is true.
+    -- Do NOT rebuild here — doing so and in DrawScreen deletes+recreates the
+    -- display list twice in the same render frame, causing flicker.
 end
 
 -------------------------------------------------------------------------------
@@ -1549,6 +1614,14 @@ function widget:GameFrame(n)
                 Spring.Echo(string.format(
                     "BAR Charts v2.2: Ready — %s, buffering %d active participant team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
+                -- Log the initial tracked team roster so it's easy to verify
+                -- which teams were admitted by isActiveParticipant().
+                Spring.Echo("BAR Charts: Tracked teams:")
+                for tid, stats in pairs(allyTeams) do
+                    Spring.Echo(string.format("  teamID=%-3d  '%s'%s",
+                        tid, stats.playerName,
+                        (tid == viewedTeamID) and "  ◀ default view" or ""))
+                end
             end
         end
         return
