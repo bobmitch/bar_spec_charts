@@ -225,12 +225,21 @@ local function ringSample(tid, key, numPts)
 end
 
 -- ── Builder-efficiency sampler ────────────────────────────────────────────────
-local builderUnits     = {}
+-- builderUnits[teamID][unitID] = { bp=number, defID=number }
+-- Keyed by team so spectator mode can track all teams simultaneously.
+-- Previously a flat table with no team dimension meant only myTeamID builders
+-- were ever tracked — spectators always got zero efficiency for every team.
+local builderUnits = {}
+
+-- maxMetalUseCache[builderDefID][targetDefID] = maxMetalPerFrame
+-- Pure math from UnitDefs — safe to share across teams.
 local maxMetalUseCache = {}
-local buildEffSamples     = {}
-local buildEffSampleIndex = 0
-local buildEffSampleCount = 0
-local buildEffTickCounter = 0
+
+-- Per-team rolling average state for build efficiency.
+-- buildEffState[teamID] = { samples={}, index=0, count=0, tickCounter=0 }
+-- Previously a single global window caused teams to bleed into each other
+-- when switching view, and was never populated during spectator mode.
+local buildEffState = {}
 
 -- ── Chart/card layout objects ─────────────────────────────────────────────────
 local charts    = {}
@@ -365,17 +374,29 @@ local function drawRoundedRect(x, y, w, h, r, filled)
 end
 
 -------------------------------------------------------------------------------
--- BUILD EFFICIENCY
+-- BUILD EFFICIENCY (per-team)
 -------------------------------------------------------------------------------
 
-local function sampleBuildEfficiency()
+-- Ensure per-team build efficiency state is initialised.
+local function ensureBuildEffState(tid)
+    if not buildEffState[tid] then
+        buildEffState[tid] = { samples = {}, index = 0, count = 0, tickCounter = 0 }
+        for i = 1, BUILD_EFF_WINDOW_SIZE do buildEffState[tid].samples[i] = 0 end
+    end
+end
+
+-- Sample instantaneous build efficiency for a single team.
+-- Returns 0..100.  Called once per BUILD_EFF_TICKS_PER_SAMPLE for each team.
+local function sampleBuildEfficiencyForTeam(tid)
+    local teamBuilders = builderUnits[tid]
+    if not teamBuilders then return 0 end
+
     local effSum, effCount = 0, 0
-    for uid, bd in pairs(builderUnits) do
-        local bp    = bd.bp
-        local defID = bd.defID
+    for uid, bd in pairs(teamBuilders) do
+        local defID    = bd.defID
         local targetID = Spring.GetUnitIsBuilding(uid)
         if targetID then
-            local tDefID = Spring.GetUnitDefID(targetID)
+            local tDefID   = Spring.GetUnitDefID(targetID)
             local maxMetal = nil
             if defID and tDefID then
                 local row = maxMetalUseCache[defID]
@@ -385,7 +406,7 @@ local function sampleBuildEfficiency()
                     local tud = UnitDefs[tDefID]
                     if bud and tud then
                         local bt = math.max(tud.buildTime or 1, 1)
-                        maxMetal = (bp / bt) * (tud.metalCost or 0)
+                        maxMetal = (bd.bp / bt) * (tud.metalCost or 0)
                     else
                         maxMetal = 0
                     end
@@ -393,40 +414,50 @@ local function sampleBuildEfficiency()
                     maxMetalUseCache[defID][tDefID] = maxMetal
                 end
             end
+            -- GetUnitResources works for spectators on all teams.
             local _, mPull = Spring.GetUnitResources(uid, "metal")
-            local mUsing = mPull or 0
+            local mUsing   = mPull or 0
             if maxMetal and maxMetal > 0 then
                 effSum   = effSum   + math.min(1.0, mUsing / maxMetal)
                 effCount = effCount + 1
             end
         end
     end
+
     if effCount == 0 then
-        local stats = allyTeams[myTeamID]
-        return (stats and stats.totalBP or 0) > 0 and 100 or 0
+        -- No builder is actively building.  If the team has build power at all,
+        -- treat idle builders as 100% (they could build, they choose not to).
+        -- If there are genuinely no builders, return 0.
+        local stats = allyTeams[tid]
+        return (stats and (stats.buildPower or 0) > 0) and 100 or 0
     end
     return (effSum / effCount) * 100
 end
 
-local function pushBuildEffSample(value)
-    buildEffSampleIndex = (buildEffSampleIndex % BUILD_EFF_WINDOW_SIZE) + 1
-    buildEffSamples[buildEffSampleIndex] = value
-    if buildEffSampleCount < BUILD_EFF_WINDOW_SIZE then
-        buildEffSampleCount = buildEffSampleCount + 1
-    end
+-- Push one instantaneous sample into the rolling window for a team and update
+-- stats.buildEfficiency with the current rolling average.
+local function pushBuildEffSampleForTeam(tid, value)
+    ensureBuildEffState(tid)
+    local s = buildEffState[tid]
+    s.index = (s.index % BUILD_EFF_WINDOW_SIZE) + 1
+    s.samples[s.index] = value
+    if s.count < BUILD_EFF_WINDOW_SIZE then s.count = s.count + 1 end
     local sum = 0
-    for i = 1, buildEffSampleCount do sum = sum + (buildEffSamples[i] or 0) end
-    local stats = allyTeams[myTeamID]
-    if stats then stats.buildEfficiency = sum / buildEffSampleCount end
+    for i = 1, s.count do sum = sum + (s.samples[i] or 0) end
+    local stats = allyTeams[tid]
+    if stats then stats.buildEfficiency = sum / s.count end
 end
 
-local function resetBuildEffSamples()
-    buildEffSamples     = {}
-    buildEffSampleIndex = 0
-    buildEffSampleCount = 0
-    buildEffTickCounter = 0
-    local stats = allyTeams[myTeamID]
-    if stats then stats.buildEfficiency = 0 end
+-- Reset efficiency state for one team (or all teams if tid is nil).
+local function resetBuildEffForTeam(tid)
+    if tid then
+        buildEffState[tid] = nil   -- ensureBuildEffState will re-create on next push
+        local stats = allyTeams[tid]
+        if stats then stats.buildEfficiency = 0 end
+    else
+        buildEffState = {}
+        for t, stats in pairs(allyTeams) do stats.buildEfficiency = 0 end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -949,19 +980,22 @@ end
 local function seedBuildPower()
     builderUnits = {}
     for tid in pairs(allyTeams) do
-        local stats   = allyTeams[tid]
+        builderUnits[tid] = {}
+        local stats = allyTeams[tid]
         stats.buildPower = 0
         local units = Spring.GetTeamUnits(tid) or {}
         for _, uid in ipairs(units) do
-            local ud = UnitDefs[Spring.GetUnitDefID(uid) or 0]
+            local udid = Spring.GetUnitDefID(uid)
+            local ud   = UnitDefs[udid or 0]
             if ud and ud.isBuilder then
                 local bp = ud.buildSpeed or 0
                 stats.buildPower = stats.buildPower + bp
-                if tid == myTeamID then
-                    builderUnits[uid] = { bp = bp, defID = Spring.GetUnitDefID(uid) }
+                if bp > 0 then
+                    builderUnits[tid][uid] = { bp = bp, defID = udid }
                 end
             end
         end
+        ensureBuildEffState(tid)
     end
 end
 
@@ -981,14 +1015,14 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     local bp   = (ud and ud.isBuilder) and (ud.buildSpeed or 0) or 0
     local ts   = allyTeams[unitTeam]
     if ts then
-        ts.armyValue  = ts.armyValue  + cost
-        if bp > 0 then ts.buildPower = ts.buildPower + bp end
-    end
-    -- Builder tracking only relevant when we have a local team.
-    if myTeamID and unitTeam == myTeamID then
-        local mts = allyTeams[myTeamID]
-        if mts then mts.unitCount = mts.unitCount + 1 end
-        if bp > 0 then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
+        ts.armyValue = ts.armyValue + cost
+        if bp > 0 then
+            ts.buildPower = ts.buildPower + bp
+            -- Track builder for efficiency sampling for this specific team.
+            if not builderUnits[unitTeam] then builderUnits[unitTeam] = {} end
+            builderUnits[unitTeam][unitID] = { bp = bp, defID = unitDefID }
+        end
+        ts.unitCount = ts.unitCount + 1
     end
 end
 
@@ -998,16 +1032,13 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
     local bp   = (ud and ud.isBuilder) and (ud.buildSpeed or 0) or 0
     local ts   = allyTeams[unitTeam]
     if ts then
-        ts.armyValue = math.max(0, ts.armyValue - cost)
-        if bp > 0 then ts.buildPower = math.max(0, ts.buildPower - bp) end
-    end
-    if myTeamID and unitTeam == myTeamID then
-        local mts = allyTeams[myTeamID]
-        if mts then
-            mts.unitCount = math.max(0, mts.unitCount - 1)
-            mts.metalLost = mts.metalLost + cost
+        ts.armyValue  = math.max(0, ts.armyValue - cost)
+        ts.metalLost  = ts.metalLost + cost
+        ts.unitCount  = math.max(0, ts.unitCount - 1)
+        if bp > 0 then
+            ts.buildPower = math.max(0, ts.buildPower - bp)
+            if builderUnits[unitTeam] then builderUnits[unitTeam][unitID] = nil end
         end
-        builderUnits[unitID] = nil
     end
 end
 
@@ -1019,22 +1050,19 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     local nts  = allyTeams[newTeam]
     if ots then
         ots.armyValue = math.max(0, ots.armyValue - cost)
-        if bp > 0 then ots.buildPower = math.max(0, ots.buildPower - bp) end
+        ots.unitCount = math.max(0, ots.unitCount - 1)
+        if bp > 0 then
+            ots.buildPower = math.max(0, ots.buildPower - bp)
+            if builderUnits[oldTeam] then builderUnits[oldTeam][unitID] = nil end
+        end
     end
     if nts then
         nts.armyValue = nts.armyValue + cost
-        if bp > 0 then nts.buildPower = nts.buildPower + bp end
-    end
-    if myTeamID then
-        if oldTeam == myTeamID then
-            local mts = allyTeams[myTeamID]
-            if mts then mts.unitCount = math.max(0, mts.unitCount - 1) end
-            builderUnits[unitID] = nil
-        end
-        if newTeam == myTeamID then
-            local mts = allyTeams[myTeamID]
-            if mts then mts.unitCount = mts.unitCount + 1 end
-            if bp > 0 then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
+        nts.unitCount = nts.unitCount + 1
+        if bp > 0 then
+            nts.buildPower = nts.buildPower + bp
+            if not builderUnits[newTeam] then builderUnits[newTeam] = {} end
+            builderUnits[newTeam][unitID] = { bp = bp, defID = unitDefID }
         end
     end
 end
@@ -1242,14 +1270,6 @@ local function collectStats(gameFrame)
             ringPush(tid, "damageTaken",     stats.damageTaken)
             ringPush(tid, "buildEfficiency", stats.buildEfficiency)
         end
-    end
-
-    -- Build power total — only meaningful when we have a local team.
-    if myTeamID then
-        local totalBP = 0
-        for _, bd in pairs(builderUnits) do totalBP = totalBP + bd.bp end
-        local mts = allyTeams[myTeamID]
-        if mts then mts.totalBP = totalBP end
     end
 
     -- ── Update displayed stat-card values (viewed team) ───────────────────
@@ -1510,7 +1530,9 @@ function widget:Initialize()
     histHead     = {}
     histFull     = {}
     builderUnits = {}
-    resetBuildEffSamples()
+    buildEffState = {}
+    maxMetalUseCache = {}
+    resetBuildEffForTeam(nil)   -- clears all per-team windows
     buildChartsAndCards()
     local chartCfg, cardCfg = loadConfig()
     applyConfig(chartCfg, cardCfg)
@@ -1627,12 +1649,16 @@ function widget:GameFrame(n)
         return
     end
 
-    -- Build efficiency sampler — only useful when we have a local team.
-    if myTeamID then
-        buildEffTickCounter = buildEffTickCounter + 1
-        if buildEffTickCounter >= BUILD_EFF_TICKS_PER_SAMPLE then
-            buildEffTickCounter = 0
-            pushBuildEffSample(sampleBuildEfficiency())
+    -- Sample build efficiency for every tracked team, not just myTeamID.
+    -- Each team has its own tick counter and rolling window so they are
+    -- completely independent — switching view never mixes data between teams.
+    for tid in pairs(allyTeams) do
+        ensureBuildEffState(tid)
+        local s = buildEffState[tid]
+        s.tickCounter = s.tickCounter + 1
+        if s.tickCounter >= BUILD_EFF_TICKS_PER_SAMPLE then
+            s.tickCounter = 0
+            pushBuildEffSampleForTeam(tid, sampleBuildEfficiencyForTeam(tid))
         end
     end
 
@@ -1648,19 +1674,21 @@ function widget:GameStart()
     chartsReadyWaitFrames = 0
     frameCounter          = 0
     builderUnits          = {}
+    buildEffState         = {}
+    maxMetalUseCache      = {}
     history               = {}
     histHead              = {}
     histFull              = {}
-    resetBuildEffSamples()
     for _, stats in pairs(allyTeams) do
-        stats.armyValue = 0; stats.unitCount   = 0
-        stats.kills     = 0; stats.losses      = 0
-        stats.metalLost = 0; stats.damageDealt = 0
+        stats.armyValue = 0; stats.unitCount      = 0
+        stats.kills     = 0; stats.losses         = 0
+        stats.metalLost = 0; stats.damageDealt    = 0
         stats.damageTaken = 0; stats.buildEfficiency = 0
-        stats.metalStall  = 0; stats.totalBP   = 0
+        stats.metalStall  = 0; stats.totalBP      = 0
+        stats.buildPower  = 0
     end
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.2: Game started")
+    Spring.Echo("BAR Charts v2.3: Game started")
 end
 
 -------------------------------------------------------------------------------
@@ -1876,15 +1904,18 @@ function widget:TextCommand(command)
         end
         return true
     elseif command == "barcharts bp" then
-        Spring.Echo("=== Builder Efficiency Diagnostic ===")
-        local stats = allyTeams[myTeamID]
+        local tid    = viewedTeamID
+        local stats  = allyTeams[tid]
+        local tBuilders = builderUnits[tid] or {}
+        Spring.Echo(string.format("=== Builder Efficiency Diagnostic: team %s ('%s') ===",
+            tostring(tid), stats and stats.playerName or "?"))
+        local s = buildEffState[tid]
         Spring.Echo(string.format("  Rolling avg: %.1f%%  (samples %d/%d)",
             stats and stats.buildEfficiency or 0,
-            buildEffSampleCount, BUILD_EFF_WINDOW_SIZE))
+            s and s.count or 0, BUILD_EFF_WINDOW_SIZE))
         local total, active, effSum, effCount = 0, 0, 0, 0
-        for uid, bd in pairs(builderUnits) do
+        for uid, bd in pairs(tBuilders) do
             total = total + 1
-            local bp   = bd.bp
             local tuid = Spring.GetUnitIsBuilding(uid)
             local tdef = tuid and Spring.GetUnitDefID(tuid)
             local mm   = (bd.defID and tdef and maxMetalUseCache[bd.defID])
@@ -1894,11 +1925,12 @@ function widget:TextCommand(command)
             local r  = (mm > 0) and math.min(1.0, mu/mm) or nil
             local bud = bd.defID and UnitDefs[bd.defID]
             Spring.Echo(string.format("    uid=%d  %s  bp=%.0f  building=%s  eff=%s",
-                uid, bud and bud.name or "?", bp, tostring(tuid ~= nil),
+                uid, bud and bud.name or "?", bd.bp, tostring(tuid ~= nil),
                 r and string.format("%.0f%%", r*100) or "idle"))
             if r then effSum = effSum+r; effCount = effCount+1; active = active+1 end
         end
-        local inst = effCount > 0 and (effSum/effCount*100) or ((stats and stats.totalBP or 0) > 0 and 100 or 0)
+        local inst = effCount > 0 and (effSum/effCount*100)
+                     or ((stats and (stats.buildPower or 0) > 0) and 100 or 0)
         Spring.Echo(string.format("  total=%d active=%d instant=%.1f%% rolling=%.1f%%",
             total, active, inst, stats and stats.buildEfficiency or 0))
         return true
