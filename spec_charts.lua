@@ -37,6 +37,17 @@
       and always sets chromeDirty = true.  Previously the multi-team series
       could point at stale teamIDs after the viewed player left/resigned.
 
+    Y-axis zero floor (v2.2):
+      Charts that represent cumulative or absolute quantities (army value,
+      build power, unit counts, kills, losses) now carry zeroFloor = true.
+      When set, the Y-axis minimum is clamped to 0 regardless of the data
+      minimum, preventing the axis from floating up to a misleading baseline.
+      Resource income/usage and damage charts retain dynamic scaling because
+      the relative shape between two series matters more than distance from 0.
+      The flag is a field on the Chart object and is respected in both
+      computeRange() (line draw, every frame) and rebuildChromeList() (grid
+      labels, rebuilt on structural change).
+
     Architecture notes (FBO / shader feasibility):
       Spring's Lua GL is immediate-mode only — no VBO, no UBO, no GLSL upload,
       no framebuffer render-target.  gl.CreateList is the sole batching primitive.
@@ -467,10 +478,16 @@ end
 local Chart = {}
 Chart.__index = Chart
 
--- series = { { label, color, seriesKey } ... }
+-- series    = { { label, color, seriesKey } ... }
 -- seriesKey maps to history[teamID][seriesKey]
 -- For multiTeam charts seriesKey is overridden per-team via rebuildMultiTeam.
-function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
+-- zeroFloor = bool  (optional, default false)
+--   When true the Y-axis minimum is always 0, regardless of the data minimum.
+--   Use for absolute/cumulative quantities (army value, build power, kills,
+--   losses) where floating the baseline creates a misleading visual slope.
+--   Leave false for rate/delta charts (income, damage) where the relative
+--   shape between series matters more than distance from zero.
+function Chart.new(id, label, icon, x, y, chartType, series, multiTeam, zeroFloor)
     local self = setmetatable({}, Chart)
     self.id         = id
     self.label      = label
@@ -485,6 +502,7 @@ function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     self.chartType  = chartType
     self.series     = series    -- { label, color, seriesKey, teamID? }
     self.multiTeam  = multiTeam or false
+    self.zeroFloor  = zeroFloor or false   -- hard-zero Y minimum when true
     self.isDragging = false
     self.dragStartX = 0
     self.dragStartY = 0
@@ -580,6 +598,50 @@ function StatCard:isMouseOver(mx, my)
 end
 
 -------------------------------------------------------------------------------
+-- RANGE COMPUTATION HELPER
+-------------------------------------------------------------------------------
+
+-- Shared logic for computing the Y-axis min/max for a chart.
+-- Called from both rebuildChromeList() (grid labels) and computeRange()
+-- (live line draw).  Keeps the two sites in sync.
+--
+-- Returns minV, maxV, range.
+-- chart.zeroFloor = true  → minV is always 0 (no padding below data).
+-- chartType-specific overrides (percent, storage, demand) still take priority
+-- over zeroFloor since those types carry their own semantic range requirements.
+local function applyRangePolicy(chart, rawMin, rawMax)
+    local mn, mx = rawMin, rawMax
+
+    if chart.chartType == "percent" then
+        mn = 0; mx = 100
+    elseif chart.chartType == "storage" then
+        local ab = math.max(math.abs(mn), math.abs(mx), 100)
+        local p  = ab * 0.12
+        mn = -(ab+p); mx = (ab+p)
+    elseif chart.chartType == "demand" then
+        local ab = math.max(math.abs(mn), math.abs(mx), 100)
+        local p  = ab * 0.15
+        mn = -(ab+p); mx = (ab+p)
+    elseif chart.zeroFloor then
+        -- Hard zero floor: clamp minimum to 0, add headroom only at top.
+        local span = mx - 0
+        local p    = span > 0 and span * 0.12 or math.max(mx * 0.1, 100)
+        mn = 0
+        mx = mx + p
+    else
+        -- Default dynamic scaling with symmetric padding.
+        local span = mx - mn
+        local p    = span > 0 and span * 0.12 or math.max(mx * 0.1, 100)
+        mn = math.max(0, mn - p)
+        mx = mx + p
+    end
+
+    local r = mx - mn
+    if r == 0 then r = 1 end
+    return mn, mx, r
+end
+
+-------------------------------------------------------------------------------
 -- DISPLAY-LIST MANAGEMENT
 -------------------------------------------------------------------------------
 
@@ -662,35 +724,20 @@ local function rebuildChromeList()
                             if v and not (v ~= v) then allV[#allV+1] = v end
                         end
                     end
-                    local minV, maxV
+                    local rawMin, rawMax
                     if #allV > 0 then
-                        minV = allV[1]; maxV = allV[1]
+                        rawMin = allV[1]; rawMax = allV[1]
                         for j = 2, #allV do
                             local v = allV[j]
-                            if v < minV then minV = v end
-                            if v > maxV then maxV = v end
+                            if v < rawMin then rawMin = v end
+                            if v > rawMax then rawMax = v end
                         end
                     else
-                        minV, maxV = 0, 100
+                        rawMin, rawMax = 0, 100
                     end
 
-                    if chart.chartType == "percent" then
-                        minV = 0; maxV = 100
-                    elseif chart.chartType == "storage" then
-                        local ab = math.max(math.abs(minV), math.abs(maxV), 100)
-                        local p  = ab * 0.12
-                        minV = -(ab+p); maxV = (ab+p)
-                    elseif chart.chartType == "demand" then
-                        local ab = math.max(math.abs(minV), math.abs(maxV), 100)
-                        local p  = ab * 0.15
-                        minV = -(ab+p); maxV = (ab+p)
-                    else
-                        local span = maxV - minV
-                        local p    = span > 0 and span*0.12 or math.max(maxV*0.1, 100)
-                        minV = math.max(0, minV-p); maxV = maxV+p
-                    end
-                    local range = maxV - minV
-                    if range == 0 then range = 1 end
+                    -- Apply range policy (zeroFloor, chartType overrides, padding).
+                    local minV, maxV, range = applyRangePolicy(chart, rawMin, rawMax)
 
                     chart._minV = minV; chart._maxV = maxV; chart._range = range
                     chart._cX   = cX;  chart._cY   = cY
@@ -779,7 +826,8 @@ end
 -------------------------------------------------------------------------------
 
 local function computeRange(chart)
-    -- Re-reads current ring buffer to get live min/max.
+    -- Re-reads current ring buffer to get live min/max, then applies the same
+    -- range policy as rebuildChromeList() so grid labels and lines always agree.
     -- Uses an explicit loop — table.unpack hits Lua's stack limit with 150+ values.
     local mn, mx
     for i = 1, #chart.series do
@@ -793,24 +841,10 @@ local function computeRange(chart)
     end
     if mn == nil then return nil end
 
-    if chart.chartType == "percent" then
-        mn = 0; mx = 100
-    elseif chart.chartType == "storage" then
-        local ab = math.max(math.abs(mn), math.abs(mx), 100)
-        local p  = ab*0.12; mn = -(ab+p); mx = (ab+p)
-    elseif chart.chartType == "demand" then
-        local ab = math.max(math.abs(mn), math.abs(mx), 100)
-        local p  = ab*0.15; mn = -(ab+p); mx = (ab+p)
-    else
-        local span = mx - mn
-        local p    = span > 0 and span*0.12 or math.max(mx*0.1, 100)
-        mn = math.max(0, mn-p); mx = mx+p
-    end
-    local r = mx - mn
-    if r == 0 then r = 1 end
+    local minV, maxV, r = applyRangePolicy(chart, mn, mx)
     -- Cache for chrome (grid labels snap on next chrome rebuild)
-    chart._minV = mn; chart._maxV = mx; chart._range = r
-    return mn, mx, r
+    chart._minV = minV; chart._maxV = maxV; chart._range = r
+    return minV, maxV, r
 end
 
 local function drawChartLines(chart)
@@ -1295,55 +1329,61 @@ local function buildChartsAndCards()
     statCards = {}
 
     -- ── Line Charts ────────────────────────────────────────────────────────
+    -- Metal and energy: dynamic scaling — the gap between income and usage
+    -- lines is what matters; zero-flooring would collapse the signal at scale.
     charts.metal = Chart.new("chart-metal", "METAL", "⚙",
         vsx-350, vsy-230, "dual", {
             { label="Income", color=COLOR.accent,  seriesKey="metalIncome"  },
             { label="Usage",  color=COLOR.accent2, seriesKey="metalUsage"   },
-        })
+        }, false, false)
 
     charts.energy = Chart.new("chart-energy", "ENERGY", "⚡",
         vsx-660, vsy-230, "dual", {
             { label="Income", color=COLOR.accent,  seriesKey="energyIncome" },
             { label="Usage",  color=COLOR.accent2, seriesKey="energyUsage"  },
-        })
+        }, false, false)
 
+    -- Damage: dynamic scaling — relative shape and divergence between dealt/taken
+    -- is the key signal; absolute distance from zero is not meaningful here.
     charts.damage = Chart.new("chart-damage", "DAMAGE", "✕",
         vsx-970, vsy-230, "dual", {
             { label="Dealt", color=COLOR.success, seriesKey="damageDealt"  },
             { label="Taken", color=COLOR.danger,  seriesKey="damageTaken"  },
-        })
+        }, false, false)
 
+    -- Army value: zero-floored — floating baseline makes a small dip look like
+    -- a catastrophic collapse; the true proportion matters.
     charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙",
         vsx-350, vsy-430, "single", {
             { label="Value", color=COLOR.accent, seriesKey="armyValue" },
-        })
+        }, false, true)
 
+    -- K/D ratio: zero-floored — ratio is always non-negative and the chart
+    -- should read clearly against a stable zero baseline.
     charts.kd = Chart.new("chart-kd", "K/D", "✕",
         vsx-660, vsy-430, "ratio", {
             { label="Ratio", color=COLOR.success, seriesKey="kills",
-              -- k/d is derived; we will compute it in drawChartLines by reading
-              -- kills+losses from the viewed-team buffer.  Use a special marker.
               isDerived = true,
-              deriveFn  = function()
-                  -- Returns the latest-sample K/D ratio.  Called from
-                  -- getSamples override below.
-              end
             },
-        })
+        }, false, true)
 
+    -- Build efficiency: chartType="percent" already forces 0-100, so zeroFloor
+    -- is redundant but set for clarity and forward-compatibility.
     charts.buildEfficiency = Chart.new("chart-build-efficiency",
         "BUILDER EFFICIENCY", "🔧", vsx-970, vsy-430, "percent", {
             { label="Efficiency", color=COLOR.gold, seriesKey="buildEfficiency" },
-        })
+        }, false, true)
 
+    -- Multi-team army and build power: zero-floored — comparing absolute team
+    -- strengths requires a shared zero baseline; a floating axis makes a weaker
+    -- team look equal to a stronger one just because they share the same view.
     charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",
-        vsx-1280, vsy-430, "multi", {}, true)
+        vsx-1280, vsy-430, "multi", {}, true, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧",
-        vsx-1280, vsy-230, "multi", {}, true)
+        vsx-1280, vsy-230, "multi", {}, true, true)
 
     -- K/D chart: override getSamples to compute ratio from kills+losses buffers
     do
-        local origGetSamples = charts.kd.getSamples
         charts.kd.getSamples = function(self, i)
             -- Sample kills and losses independently then compute per-point ratio
             local tid     = viewedTeamID
@@ -1879,6 +1919,11 @@ function widget:TextCommand(command)
                 tid, stats.playerName, mine, viewing,
                 stats.metalIncome, stats.metalUsage,
                 stats.armyValue, tostring(full), head))
+        end
+        -- Also report zeroFloor status per chart for easy verification
+        Spring.Echo("-- CHART ZERO-FLOOR FLAGS --")
+        for id, chart in pairs(charts) do
+            Spring.Echo(string.format("  %-30s  zeroFloor=%s", id, tostring(chart.zeroFloor)))
         end
         return true
     elseif command == "barcharts viewdebug" then
