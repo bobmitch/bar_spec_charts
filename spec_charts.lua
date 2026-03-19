@@ -901,28 +901,28 @@ local function drawChartLines(chart)
             end)
 
             -- Latest-value dot + label
+            -- Multi-team charts render the dot only — no text label.  With N
+            -- series the labels stack at whatever Y the data happens to be,
+            -- causing collisions and misreads.  The coloured dot is enough to
+            -- anchor each line at the right edge.
             local last = pts[nPts]
             if last and not (last ~= last) then
                 gl.Color(clr[1], clr[2], clr[3], 0.8*am)
                 gl.PointSize(6)
                 gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
 
-                local vTxt
-                if     chart.chartType == "percent" then
-                    vTxt = string.format("%.0f%%", last)
-                elseif chart.chartType == "storage" then
-                    vTxt = string.format("%+.0f%%", last)
-                elseif chart.chartType == "multi" or chart.chartType == "dual" then
-                    local sn = #s.label > 8 and string.sub(s.label, 1, 6).."…" or s.label
-                    vTxt = sn.." "..formatNumber(last)
-                else
-                    vTxt = formatNumber(last)
+                if chart.chartType ~= "multi" then
+                    local vTxt
+                    if     chart.chartType == "percent" then
+                        vTxt = string.format("%.0f%%", last)
+                    elseif chart.chartType == "storage" then
+                        vTxt = string.format("%+.0f%%", last)
+                    else
+                        vTxt = formatNumber(last)
+                    end
+                    gl.Color(clr[1], clr[2], clr[3], 1.0*am)
+                    gl.Text(vTxt, cX+cW+2, toY(last)-4, 9, "o")
                 end
-
-                local lOff = (chart.chartType == "multi" or chart.chartType == "dual")
-                             and (si-1)*13 or 0
-                gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-                gl.Text(vTxt, cX+cW+2, toY(last)-4+lOff, 9, "o")
             end
         end
     end
@@ -951,14 +951,6 @@ local function drawChartLines(chart)
             gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
             gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
         end
-    end
-
-    -- Viewed-player name strip when not watching own team
-    -- (always shown for spectators since myTeamID is nil)
-    if viewedTeamID ~= myTeamID and vStats then
-        local tc = vStats.color
-        gl.Color(tc[1], tc[2], tc[3], 0.9)
-        gl.Text("▶ "..vStats.playerName, w/2, h-pad.top-10, 9, "co")
     end
 
     gl.PopMatrix()
@@ -1510,7 +1502,7 @@ end
 
 -- Switches the displayed player.  O(1) pointer swap + multi-team series refresh.
 -- FIX v2.2: now also refreshes multiTeam series so they never point at stale
--- teamIDs, and always marks chrome dirty so the name-strip updates immediately.
+-- teamIDs, and always marks chrome dirty so the title area updates immediately.
 local function switchView(targetTeamID)
     if not allyTeams[targetTeamID] then
         Spring.Echo("BAR Charts: switchView FAILED — teamID "
