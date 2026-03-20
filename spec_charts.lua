@@ -596,6 +596,7 @@ local function rebuildChromeList()
                         minV, maxV = 0, 100
                     end
 
+                    -- Y-axis range clamping
                     if chart.chartType == "percent" then
                         minV = 0; maxV = 100
                     elseif chart.chartType == "storage" then
@@ -607,9 +608,10 @@ local function rebuildChromeList()
                         local p  = ab * 0.15
                         minV = -(ab+p); maxV = (ab+p)
                     else
-                        local span = maxV - minV
-                        local p    = span > 0 and span*0.12 or math.max(maxV*0.1, 100)
-                        minV = math.max(0, minV-p); maxV = maxV+p
+                        -- single / dual / multi / ratio: always anchor to 0
+                        minV = 0
+                        local p = maxV > 0 and maxV*0.12 or 100
+                        maxV = maxV + p
                     end
                     local range = maxV - minV
                     if range == 0 then range = 1 end
@@ -721,9 +723,10 @@ local function computeRange(chart)
         local ab = math.max(math.abs(mn), math.abs(mx), 100)
         local p  = ab*0.15; mn = -(ab+p); mx = (ab+p)
     else
-        local span = mx - mn
-        local p    = span > 0 and span*0.12 or math.max(mx*0.1, 100)
-        mn = math.max(0, mn-p); mx = mx+p
+        -- single / dual / multi / ratio: always anchor to 0
+        mn = 0
+        local p = mx > 0 and mx*0.12 or 100
+        mx = mx + p
     end
     local r = mx - mn
     if r == 0 then r = 1 end
@@ -802,14 +805,12 @@ local function drawChartLines(chart)
                 gl.PointSize(6)
                 gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
 
+                -- Value label: no series name prefix for any chart type
                 local vTxt
                 if     chart.chartType == "percent" then
                     vTxt = string.format("%.0f%%", last)
                 elseif chart.chartType == "storage" then
                     vTxt = string.format("%+.0f%%", last)
-                elseif chart.chartType == "multi" or chart.chartType == "dual" then
-                    local sn = #s.label > 8 and string.sub(s.label, 1, 6).."…" or s.label
-                    vTxt = sn.." "..formatNumber(last)
                 else
                     vTxt = formatNumber(last)
                 end
@@ -845,11 +846,7 @@ local function drawChartLines(chart)
         end
     end
 
-    if viewedTeamID ~= myTeamID and vStats then
-        local tc = vStats.color
-        gl.Color(tc[1], tc[2], tc[3], 0.9)
-        gl.Text("▶ "..vStats.playerName, w/2, h-pad.top-10, 9, "co")
-    end
+    -- Removed: "▶ playerName" overlay — names are not shown on charts
 
     gl.PopMatrix()
 end
