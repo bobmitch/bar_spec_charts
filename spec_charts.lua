@@ -202,23 +202,41 @@ local READY_WAIT_FRAMES     = GAME_FPS * 3
 
 local rmlContext  = nil
 local rmlDocument = nil
+local pillVisible = true   -- tracks whether the pill UI is shown
 
+-- Update pill label/classes to match current chartsInteractive state.
+-- Safe to call whether or not the document exists.
+local function syncPillState()
+    if not rmlDocument then return end
+    local pill = rmlDocument:GetElementById("toggle-pill")
+    if not pill then return end
+    if chartsInteractive then
+        pill:SetClass("state-edit",   true)
+        pill:SetClass("state-locked", false)
+        pill.inner_rml = "CHARTS: EDIT"
+    else
+        pill:SetClass("state-locked", true)
+        pill:SetClass("state-edit",   false)
+        pill.inner_rml = "CHARTS: LOCKED"
+    end
+end
+
+-- Show or hide the pill document without affecting chartsInteractive.
+local function setPillVisible(visible)
+    pillVisible = visible
+    if not rmlDocument then return end
+    if visible then
+        syncPillState()
+        rmlDocument:Show()
+    else
+        rmlDocument:Hide()
+    end
+end
+
+-- Called when the pill is clicked in-game.
 local function onToggleClick(event)
     chartsInteractive = not chartsInteractive
-    if rmlDocument then
-        local pill = rmlDocument:GetElementById("toggle-pill")
-        if pill then
-            if chartsInteractive then
-                pill:SetClass("state-edit",   true)
-                pill:SetClass("state-locked", false)
-                pill.inner_rml = "CHARTS: EDIT"
-            else
-                pill:SetClass("state-locked", true)
-                pill:SetClass("state-edit",   false)
-                pill.inner_rml = "CHARTS: LOCKED"
-            end
-        end
-    end
+    syncPillState()
     chromeDirty = true
     Spring.Echo("BAR Charts: " .. (chartsInteractive and "EDIT mode ON" or "LOCKED"))
 end
@@ -239,7 +257,9 @@ local function initRmlToggle()
     if not pill then return end
     pill:AddEventListener("click", onToggleClick, false)
     pill:SetClass("state-locked", true)
-    rmlDocument:Show()
+    if pillVisible then
+        rmlDocument:Show()
+    end
 end
 
 local function shutdownRmlToggle()
@@ -1740,7 +1760,20 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Config reset — restart widget to apply")
         return true
     elseif command == "barcharts edit" then
-        onToggleClick(nil); return true
+        -- Toggle edit mode directly — does not affect pill visibility.
+        chartsInteractive = not chartsInteractive
+        syncPillState()
+        chromeDirty = true
+        Spring.Echo("BAR Charts: " .. (chartsInteractive and "EDIT mode ON" or "LOCKED"))
+        return true
+    elseif command == "barcharts hidepill" then
+        setPillVisible(false)
+        Spring.Echo("BAR Charts: Pill hidden  (/barcharts showpill to restore,  /barcharts edit to toggle edit mode)")
+        return true
+    elseif command == "barcharts showpill" then
+        setPillVisible(true)
+        Spring.Echo("BAR Charts: Pill visible")
+        return true
     elseif command == "barcharts debug" then
         Spring.Echo("=== BAR Charts v2.3 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
