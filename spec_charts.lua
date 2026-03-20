@@ -804,21 +804,6 @@ local function drawChartLines(chart)
                 gl.Color(clr[1], clr[2], clr[3], 0.8*am)
                 gl.PointSize(6)
                 gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
-
-                -- Value label: no series name prefix for any chart type
-                local vTxt
-                if     chart.chartType == "percent" then
-                    vTxt = string.format("%.0f%%", last)
-                elseif chart.chartType == "storage" then
-                    vTxt = string.format("%+.0f%%", last)
-                else
-                    vTxt = formatNumber(last)
-                end
-
-                local lOff = (chart.chartType == "multi" or chart.chartType == "dual")
-                             and (si-1)*13 or 0
-                gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-                gl.Text(vTxt, cX+cW+2, toY(last)-4+lOff, 9, "o")
             end
         end
     end
