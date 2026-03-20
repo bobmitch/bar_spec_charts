@@ -1,7 +1,7 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.2 by FilthyMitch
+    v2.3 by FilthyMitch
 
     History window : exactly 60 in-game seconds = 1 800 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
@@ -19,59 +19,22 @@
       unit-event army-tracking are bypassed (no "my" units exist).
       Default viewed team is the first non-Gaia team found.
 
-    Active-team filtering (v2.2 fix):
-      isActiveParticipant(tid) is now the sole gate for admitting a team into
-      allyTeams.  It passes iff the team slot:
-        (a) is an AI team, OR
-        (b) has a human leader who is NOT spectating and IS active, OR
-        (c) has no leader but already has units (handles edge-case late joins).
-      This prevents spectator-occupied team slots from being tracked, which was
-      the root cause of incorrect/missing view-switch data in v2.1.
+    Active-team filtering (v2.3):
+      isActiveParticipant(tid) admits a team if:
+        (a) it is an AI team, OR
+        (b) it has a human leader who is NOT spectating, OR
+        (c) it has no valid leader (Gaia-like) but already has live units.
+      Dead/resigned teams are always excluded.
+      The `active` flag from GetPlayerInfo is intentionally NOT used as a gate
+      because in single-player and early-join scenarios the local player can
+      appear active=false even though they are a legitimate participant.
 
-      resolveTeamName now also reads the spectator flag from GetPlayerInfo so
-      the displayed name is always the in-game player name, not the slot number.
-
-    View-switch correctness (v2.2 fix):
-      switchView() now calls rebuildMultiTeamSeries() on both ally charts to
-      refresh their series pointers whenever the team roster may have changed,
-      and always sets chromeDirty = true.  Previously the multi-team series
-      could point at stale teamIDs after the viewed player left/resigned.
-
-    Y-axis zero floor (v2.2):
-      Charts that represent cumulative or absolute quantities (army value,
-      build power, unit counts, kills, losses) now carry zeroFloor = true.
-      When set, the Y-axis minimum is clamped to 0 regardless of the data
-      minimum, preventing the axis from floating up to a misleading baseline.
-      Resource income/usage and damage charts retain dynamic scaling because
-      the relative shape between two series matters more than distance from 0.
-      The flag is a field on the Chart object and is respected in both
-      computeRange() (line draw, every frame) and rebuildChromeList() (grid
-      labels, rebuilt on structural change).
-
-    Architecture notes (FBO / shader feasibility):
-      Spring's Lua GL is immediate-mode only — no VBO, no UBO, no GLSL upload,
-      no framebuffer render-target.  gl.CreateList is the sole batching primitive.
-      Line geometry is ~150 verts/series → GPU-trivial.  No shader path is
-      warranted or technically accessible from widget Lua.
-
-    Ring buffer layout:
-      history[teamID][seriesKey]  = flat numeric table, size HISTORY_SIZE
-      histHead[teamID][seriesKey] = integer [1..HISTORY_SIZE], points at the
-                                    NEXT slot to write (oldest valid data is
-                                    one step after head, or [1] when not full)
-      histFull[teamID][seriesKey] = bool, true once the buffer has wrapped
-
-    Controls:
-      F9             : Toggle all charts on/off
-      /barcharts view <name|teamID>  : Switch viewed player
-      /barcharts save                : Save layout
-      /barcharts reset               : Delete config, restore defaults
-      /barcharts debug               : Print state
-      /barcharts bp                  : Builder efficiency diagnostic
-
-    Edit mode (RmlUI pill, top-right):
-      LOCKED  — all chart mouse interactions suppressed
-      EDIT    — drag, scroll-to-scale, right-click to toggle enable
+    Line-chart rendering (v2.3 fix):
+      drawChartLines() no longer depends on chart._range being pre-populated
+      by rebuildChromeList().  It computes layout from PADDING constants
+      directly and sets chromeDirty=true the first time data arrives so the
+      grid/labels get a fresh rebuild.  This fixes the "awaiting data" stuck
+      state when the widget is loaded mid-game.
 
 ═══════════════════════════════════════════════════════════════════════════
 ]]
@@ -114,9 +77,9 @@ end
 local CONFIG_FILE = "bar_charts_config.lua"
 
 local GAME_FPS        = 30
-local HISTORY_SECONDS = 60                        -- exactly 1 in-game minute
-local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 1 800 frames
-local RENDER_POINTS   = 150                       -- downsample for drawing
+local HISTORY_SECONDS = 60
+local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 1800 frames
+local RENDER_POINTS   = 150
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 30
 local BUILD_EFF_WINDOW_SIZE      = 30
@@ -148,30 +111,19 @@ local COLOR = {
 local vsx, vsy          = Spring.GetViewGeometry()
 local chartsEnabled     = true
 local chartsReady       = false
-local chartsInteractive = false   -- locked by default
+local chartsInteractive = false
 
--- The team whose data the charts currently display.
 local viewedTeamID = nil
--- The local player's team.  nil when spectating (no "my" units exist).
 local myTeamID     = nil
 local myAllyTeamID = nil
--- True when the local client is a spectator.
 local isSpectator  = false
 
--- allTeams table — named allyTeams for code compatibility.
--- In player mode: only ally-group teams.
--- In spectator mode: every ACTIVE game team (spectator slots excluded).
 local allyTeams = {}
 
--- ── Ring buffers ─────────────────────────────────────────────────────────────
--- history[teamID][seriesKey][1..HISTORY_SIZE] = float
--- histHead[teamID][seriesKey] = integer, next-write slot (1-based, wraps)
--- histFull[teamID][seriesKey] = bool, true after first full wrap
 local history  = {}
 local histHead = {}
 local histFull = {}
 
--- Series keys used across teams
 local SERIES_KEYS = {
     "metalIncome", "metalUsage",
     "energyIncome", "energyUsage",
@@ -190,12 +142,10 @@ local function initTeamBuffers(tid)
         history[tid][key]  = {}
         histHead[tid][key] = 1
         histFull[tid][key] = false
-        -- Pre-allocate to avoid rehashing on first fill
         for i = 1, HISTORY_SIZE do history[tid][key][i] = 0 end
     end
 end
 
--- Push one value into the ring buffer for (teamID, seriesKey).
 local function ringPush(tid, key, value)
     local h = histHead[tid][key]
     history[tid][key][h] = value
@@ -204,21 +154,16 @@ local function ringPush(tid, key, value)
     histHead[tid][key] = h
 end
 
--- Returns count of valid samples and the logical start index in the ring.
--- If not full: startIdx = 1, count = head-1.
--- If full:     startIdx = head (oldest), count = HISTORY_SIZE.
 local function ringRange(tid, key)
     local h    = histHead[tid][key]
     local full = histFull[tid][key]
     if full then
-        return h, HISTORY_SIZE        -- oldest is at h
+        return h, HISTORY_SIZE
     else
-        return 1, h - 1               -- oldest is at 1, newest at h-1
+        return 1, h - 1
     end
 end
 
--- Downsample `count` samples from ring starting at `startIdx` into `numPts` points.
--- Returns a plain sequential table of floats.
 local function ringSample(tid, key, numPts)
     local startIdx, count = ringRange(tid, key)
     if count <= 0 then return {} end
@@ -227,7 +172,6 @@ local function ringSample(tid, key, numPts)
     if n <= 0 then return {} end
     local pts = {}
     for i = 1, n do
-        -- Map i [1..n] → logical frame index [0..count-1]
         local fi  = math.floor((i - 1) / math.max(n - 1, 1) * (count - 1) + 0.5)
         local idx = ((startIdx - 1 + fi) % HISTORY_SIZE) + 1
         pts[i] = buf[idx]
@@ -235,35 +179,19 @@ local function ringSample(tid, key, numPts)
     return pts
 end
 
--- ── Builder-efficiency sampler ────────────────────────────────────────────────
--- builderUnits[teamID][unitID] = { bp=number, defID=number }
--- Keyed by team so spectator mode can track all teams simultaneously.
--- Previously a flat table with no team dimension meant only myTeamID builders
--- were ever tracked — spectators always got zero efficiency for every team.
-local builderUnits = {}
-
--- maxMetalUseCache[builderDefID][targetDefID] = maxMetalPerFrame
--- Pure math from UnitDefs — safe to share across teams.
+local builderUnits    = {}
 local maxMetalUseCache = {}
+local buildEffState   = {}
 
--- Per-team rolling average state for build efficiency.
--- buildEffState[teamID] = { samples={}, index=0, count=0, tickCounter=0 }
--- Previously a single global window caused teams to bleed into each other
--- when switching view, and was never populated during spectator mode.
-local buildEffState = {}
-
--- ── Chart/card layout objects ─────────────────────────────────────────────────
 local charts    = {}
 local statCards = {}
 
--- ── Display lists ─────────────────────────────────────────────────────────────
 local chromeDisplayList = nil
 local chromeDirty       = true
 local hoverDisplayList  = nil
 
--- ── Frame counter for throttling heavier queries ──────────────────────────────
 local frameCounter       = 0
-local FULL_SCAN_INTERVAL = GAME_FPS   -- once per in-game second
+local FULL_SCAN_INTERVAL = GAME_FPS
 
 local chartsReadyWaitFrames = 0
 local READY_WAIT_FRAMES     = GAME_FPS * 3
@@ -388,7 +316,6 @@ end
 -- BUILD EFFICIENCY (per-team)
 -------------------------------------------------------------------------------
 
--- Ensure per-team build efficiency state is initialised.
 local function ensureBuildEffState(tid)
     if not buildEffState[tid] then
         buildEffState[tid] = { samples = {}, index = 0, count = 0, tickCounter = 0 }
@@ -396,8 +323,6 @@ local function ensureBuildEffState(tid)
     end
 end
 
--- Sample instantaneous build efficiency for a single team.
--- Returns 0..100.  Called once per BUILD_EFF_TICKS_PER_SAMPLE for each team.
 local function sampleBuildEfficiencyForTeam(tid)
     local teamBuilders = builderUnits[tid]
     if not teamBuilders then return 0 end
@@ -425,7 +350,6 @@ local function sampleBuildEfficiencyForTeam(tid)
                     maxMetalUseCache[defID][tDefID] = maxMetal
                 end
             end
-            -- GetUnitResources works for spectators on all teams.
             local _, mPull = Spring.GetUnitResources(uid, "metal")
             local mUsing   = mPull or 0
             if maxMetal and maxMetal > 0 then
@@ -436,17 +360,12 @@ local function sampleBuildEfficiencyForTeam(tid)
     end
 
     if effCount == 0 then
-        -- No builder is actively building.  If the team has build power at all,
-        -- treat idle builders as 100% (they could build, they choose not to).
-        -- If there are genuinely no builders, return 0.
         local stats = allyTeams[tid]
         return (stats and (stats.buildPower or 0) > 0) and 100 or 0
     end
     return (effSum / effCount) * 100
 end
 
--- Push one instantaneous sample into the rolling window for a team and update
--- stats.buildEfficiency with the current rolling average.
 local function pushBuildEffSampleForTeam(tid, value)
     ensureBuildEffState(tid)
     local s = buildEffState[tid]
@@ -459,10 +378,9 @@ local function pushBuildEffSampleForTeam(tid, value)
     if stats then stats.buildEfficiency = sum / s.count end
 end
 
--- Reset efficiency state for one team (or all teams if tid is nil).
 local function resetBuildEffForTeam(tid)
     if tid then
-        buildEffState[tid] = nil   -- ensureBuildEffState will re-create on next push
+        buildEffState[tid] = nil
         local stats = allyTeams[tid]
         if stats then stats.buildEfficiency = 0 end
     else
@@ -478,16 +396,7 @@ end
 local Chart = {}
 Chart.__index = Chart
 
--- series    = { { label, color, seriesKey } ... }
--- seriesKey maps to history[teamID][seriesKey]
--- For multiTeam charts seriesKey is overridden per-team via rebuildMultiTeam.
--- zeroFloor = bool  (optional, default false)
---   When true the Y-axis minimum is always 0, regardless of the data minimum.
---   Use for absolute/cumulative quantities (army value, build power, kills,
---   losses) where floating the baseline creates a misleading visual slope.
---   Leave false for rate/delta charts (income, damage) where the relative
---   shape between series matters more than distance from zero.
-function Chart.new(id, label, icon, x, y, chartType, series, multiTeam, zeroFloor)
+function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     local self = setmetatable({}, Chart)
     self.id         = id
     self.label      = label
@@ -500,14 +409,12 @@ function Chart.new(id, label, icon, x, y, chartType, series, multiTeam, zeroFloo
     self.enabled    = true
     self.visible    = true
     self.chartType  = chartType
-    self.series     = series    -- { label, color, seriesKey, teamID? }
+    self.series     = series
     self.multiTeam  = multiTeam or false
-    self.zeroFloor  = zeroFloor or false   -- hard-zero Y minimum when true
     self.isDragging = false
     self.dragStartX = 0
     self.dragStartY = 0
     self.isHovered  = false
-    -- Cached scale set by chrome rebuild, consumed by line draw
     self._minV = nil; self._maxV = nil; self._range = nil
     self._cX   = nil; self._cY  = nil; self._cW   = nil; self._cH = nil
     return self
@@ -529,7 +436,7 @@ function Chart:rebuildMultiTeamSeries()
                 label     = teamData.playerName,
                 color     = teamData.color,
                 seriesKey = seriesKey,
-                teamID    = tid,   -- multi-team charts always read from specific team
+                teamID    = tid,
             }
             idx = idx + 1
         end
@@ -542,7 +449,6 @@ function Chart:isMouseOver(mx, my)
        and my >= self.y and my <= self.y + self.height * self.scale
 end
 
--- Returns sampled data points for series i, reading from the appropriate team buffer.
 function Chart:getSamples(i)
     local s   = self.series[i]
     if not s then return {} end
@@ -595,50 +501,6 @@ end
 function StatCard:isMouseOver(mx, my)
     return mx >= self.x and mx <= self.x + CARD_WIDTH  * self.scale
        and my >= self.y and my <= self.y + CARD_HEIGHT * self.scale
-end
-
--------------------------------------------------------------------------------
--- RANGE COMPUTATION HELPER
--------------------------------------------------------------------------------
-
--- Shared logic for computing the Y-axis min/max for a chart.
--- Called from both rebuildChromeList() (grid labels) and computeRange()
--- (live line draw).  Keeps the two sites in sync.
---
--- Returns minV, maxV, range.
--- chart.zeroFloor = true  → minV is always 0 (no padding below data).
--- chartType-specific overrides (percent, storage, demand) still take priority
--- over zeroFloor since those types carry their own semantic range requirements.
-local function applyRangePolicy(chart, rawMin, rawMax)
-    local mn, mx = rawMin, rawMax
-
-    if chart.chartType == "percent" then
-        mn = 0; mx = 100
-    elseif chart.chartType == "storage" then
-        local ab = math.max(math.abs(mn), math.abs(mx), 100)
-        local p  = ab * 0.12
-        mn = -(ab+p); mx = (ab+p)
-    elseif chart.chartType == "demand" then
-        local ab = math.max(math.abs(mn), math.abs(mx), 100)
-        local p  = ab * 0.15
-        mn = -(ab+p); mx = (ab+p)
-    elseif chart.zeroFloor then
-        -- Hard zero floor: clamp minimum to 0, add headroom only at top.
-        local span = mx - 0
-        local p    = span > 0 and span * 0.12 or math.max(mx * 0.1, 100)
-        mn = 0
-        mx = mx + p
-    else
-        -- Default dynamic scaling with symmetric padding.
-        local span = mx - mn
-        local p    = span > 0 and span * 0.12 or math.max(mx * 0.1, 100)
-        mn = math.max(0, mn - p)
-        mx = mx + p
-    end
-
-    local r = mx - mn
-    if r == 0 then r = 1 end
-    return mn, mx, r
 end
 
 -------------------------------------------------------------------------------
@@ -715,8 +577,6 @@ local function rebuildChromeList()
                     gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
                     gl.PopMatrix()
                 else
-                    -- Compute axis range from current data (explicit loop — table.unpack
-                    -- hits Lua's stack limit with 150+ values)
                     local allV = {}
                     for i = 1, #chart.series do
                         local pts = chart:getSamples(i)
@@ -724,20 +584,35 @@ local function rebuildChromeList()
                             if v and not (v ~= v) then allV[#allV+1] = v end
                         end
                     end
-                    local rawMin, rawMax
+                    local minV, maxV
                     if #allV > 0 then
-                        rawMin = allV[1]; rawMax = allV[1]
+                        minV = allV[1]; maxV = allV[1]
                         for j = 2, #allV do
                             local v = allV[j]
-                            if v < rawMin then rawMin = v end
-                            if v > rawMax then rawMax = v end
+                            if v < minV then minV = v end
+                            if v > maxV then maxV = v end
                         end
                     else
-                        rawMin, rawMax = 0, 100
+                        minV, maxV = 0, 100
                     end
 
-                    -- Apply range policy (zeroFloor, chartType overrides, padding).
-                    local minV, maxV, range = applyRangePolicy(chart, rawMin, rawMax)
+                    if chart.chartType == "percent" then
+                        minV = 0; maxV = 100
+                    elseif chart.chartType == "storage" then
+                        local ab = math.max(math.abs(minV), math.abs(maxV), 100)
+                        local p  = ab * 0.12
+                        minV = -(ab+p); maxV = (ab+p)
+                    elseif chart.chartType == "demand" then
+                        local ab = math.max(math.abs(minV), math.abs(maxV), 100)
+                        local p  = ab * 0.15
+                        minV = -(ab+p); maxV = (ab+p)
+                    else
+                        local span = maxV - minV
+                        local p    = span > 0 and span*0.12 or math.max(maxV*0.1, 100)
+                        minV = math.max(0, minV-p); maxV = maxV+p
+                    end
+                    local range = maxV - minV
+                    if range == 0 then range = 1 end
 
                     chart._minV = minV; chart._maxV = maxV; chart._range = range
                     chart._cX   = cX;  chart._cY   = cY
@@ -771,10 +646,6 @@ local function rebuildChromeList()
                     -- Chart title
                     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4]*am)
                     gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
-                    -- NOTE: stall indicator and viewed-player name are NOT drawn here.
-                    -- They reference viewedTeamID which changes on view-switches but the
-                    -- display list bakes values at compile time.  They are drawn raw in
-                    -- drawChartLines() instead, where viewedTeamID is always current.
 
                     gl.PopMatrix()
                 end
@@ -823,12 +694,12 @@ end
 
 -------------------------------------------------------------------------------
 -- DRAW CHART LINES (raw every frame)
+-- v2.3: no longer depends on chrome having been built first.
+-- Layout is computed directly from PADDING constants so lines render
+-- as soon as hasData() is true, even on mid-game widget restart.
 -------------------------------------------------------------------------------
 
 local function computeRange(chart)
-    -- Re-reads current ring buffer to get live min/max, then applies the same
-    -- range policy as rebuildChromeList() so grid labels and lines always agree.
-    -- Uses an explicit loop — table.unpack hits Lua's stack limit with 150+ values.
     local mn, mx
     for i = 1, #chart.series do
         local pts = chart:getSamples(i)
@@ -841,25 +712,53 @@ local function computeRange(chart)
     end
     if mn == nil then return nil end
 
-    local minV, maxV, r = applyRangePolicy(chart, mn, mx)
-    -- Cache for chrome (grid labels snap on next chrome rebuild)
-    chart._minV = minV; chart._maxV = maxV; chart._range = r
-    return minV, maxV, r
+    if chart.chartType == "percent" then
+        mn = 0; mx = 100
+    elseif chart.chartType == "storage" then
+        local ab = math.max(math.abs(mn), math.abs(mx), 100)
+        local p  = ab*0.12; mn = -(ab+p); mx = (ab+p)
+    elseif chart.chartType == "demand" then
+        local ab = math.max(math.abs(mn), math.abs(mx), 100)
+        local p  = ab*0.15; mn = -(ab+p); mx = (ab+p)
+    else
+        local span = mx - mn
+        local p    = span > 0 and span*0.12 or math.max(mx*0.1, 100)
+        mn = math.max(0, mn-p); mx = mx+p
+    end
+    local r = mx - mn
+    if r == 0 then r = 1 end
+    chart._minV = mn; chart._maxV = mx; chart._range = r
+    return mn, mx, r
 end
 
 local function drawChartLines(chart)
     local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
     if not show or not chart.enabled then return end
     if not chart:hasData() then return end
-    if not chart._range then return end   -- chrome not yet built
 
     local mn, mx, r = computeRange(chart)
     if not mn then return end
 
-    local cX = chart._cX; local cY = chart._cY
-    local cW = chart._cW; local cH = chart._cH
-    local am = 1.0   -- enabled charts only reach here
+    -- Compute layout from constants directly — never rely on chrome having
+    -- been built first.  This is the v2.3 fix for mid-game widget restart.
+    local cX = PADDING.left
+    local cY = PADDING.bottom
+    local cW = chart.width  - PADDING.left - PADDING.right
+    local cH = chart.height - PADDING.top  - PADDING.bottom
 
+    -- Keep cached values in sync so chrome rebuilds use correct coords.
+    chart._cX = cX; chart._cY = cY
+    chart._cW = cW; chart._cH = cH
+
+    -- If chrome hasn't rendered with data yet, force a rebuild so the
+    -- grid lines and Y-axis labels appear at the correct scale.
+    if chromeDirty == false and chart._range ~= nil then
+        -- already in sync, nothing to do
+    else
+        chromeDirty = true
+    end
+
+    local am = 1.0
     local function toY(v) return cY + ((v - mn) / r) * cH end
 
     gl.PushMatrix()
@@ -874,8 +773,6 @@ local function drawChartLines(chart)
             local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
                              and toY(0) or cY
 
-            -- Filled area — skipped for multi-team charts where overlapping
-            -- fills from several series make the chart unreadable.
             if chart.chartType ~= "multi" then
                 gl.Color(clr[1], clr[2], clr[3], 0.15*am)
                 gl.BeginEnd(GL.TRIANGLE_STRIP, function()
@@ -888,7 +785,6 @@ local function drawChartLines(chart)
                 end)
             end
 
-            -- Line
             gl.Color(clr[1], clr[2], clr[3], 1.0*am)
             gl.LineWidth(2.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
@@ -900,29 +796,28 @@ local function drawChartLines(chart)
                 end
             end)
 
-            -- Latest-value dot + label
-            -- Multi-team charts render the dot only — no text label.  With N
-            -- series the labels stack at whatever Y the data happens to be,
-            -- causing collisions and misreads.  The coloured dot is enough to
-            -- anchor each line at the right edge.
             local last = pts[nPts]
             if last and not (last ~= last) then
                 gl.Color(clr[1], clr[2], clr[3], 0.8*am)
                 gl.PointSize(6)
                 gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
 
-                if chart.chartType ~= "multi" then
-                    local vTxt
-                    if     chart.chartType == "percent" then
-                        vTxt = string.format("%.0f%%", last)
-                    elseif chart.chartType == "storage" then
-                        vTxt = string.format("%+.0f%%", last)
-                    else
-                        vTxt = formatNumber(last)
-                    end
-                    gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-                    gl.Text(vTxt, cX+cW+2, toY(last)-4, 9, "o")
+                local vTxt
+                if     chart.chartType == "percent" then
+                    vTxt = string.format("%.0f%%", last)
+                elseif chart.chartType == "storage" then
+                    vTxt = string.format("%+.0f%%", last)
+                elseif chart.chartType == "multi" or chart.chartType == "dual" then
+                    local sn = #s.label > 8 and string.sub(s.label, 1, 6).."…" or s.label
+                    vTxt = sn.." "..formatNumber(last)
+                else
+                    vTxt = formatNumber(last)
                 end
+
+                local lOff = (chart.chartType == "multi" or chart.chartType == "dual")
+                             and (si-1)*13 or 0
+                gl.Color(clr[1], clr[2], clr[3], 1.0*am)
+                gl.Text(vTxt, cX+cW+2, toY(last)-4+lOff, 9, "o")
             end
         end
     end
@@ -930,18 +825,15 @@ local function drawChartLines(chart)
     gl.PopMatrix()
 
     -- ── Per-view overlays drawn raw (viewedTeamID must be live) ──────────
-    -- These cannot live in the chrome display list because gl.CreateList
-    -- bakes GL commands at compile time — viewedTeamID would be stale.
-    local pad = PADDING
-    local w   = chart.width
-    local h   = chart.height
+    local pad    = PADDING
+    local w      = chart.width
+    local h      = chart.height
     local vStats = allyTeams[viewedTeamID]
 
     gl.PushMatrix()
     gl.Translate(chart.x, chart.y, 0)
     gl.Scale(chart.scale, chart.scale, 1)
 
-    -- Stall indicator (build-efficiency chart only)
     if chart.id == "chart-build-efficiency" then
         local stall = vStats and vStats.metalStall or 0
         if stall == 2 then
@@ -951,6 +843,12 @@ local function drawChartLines(chart)
             gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
             gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
         end
+    end
+
+    if viewedTeamID ~= myTeamID and vStats then
+        local tc = vStats.color
+        gl.Color(tc[1], tc[2], tc[3], 0.9)
+        gl.Text("▶ "..vStats.playerName, w/2, h-pad.top-10, 9, "co")
     end
 
     gl.PopMatrix()
@@ -1048,7 +946,6 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
         ts.armyValue = ts.armyValue + cost
         if bp > 0 then
             ts.buildPower = ts.buildPower + bp
-            -- Track builder for efficiency sampling for this specific team.
             if not builderUnits[unitTeam] then builderUnits[unitTeam] = {} end
             builderUnits[unitTeam][unitID] = { bp = bp, defID = unitDefID }
         end
@@ -1105,54 +1002,41 @@ end
 -- ALLY TEAM INIT
 -------------------------------------------------------------------------------
 
--- FIX v2.2: isActiveParticipant — the single gate for admitting a team slot.
---
--- A team is an active participant if it is:
---   (a) an AI-controlled team, OR
---   (b) led by a human player who is NOT spectating and IS currently active
---       (i.e. not disconnected/resigned), OR
---   (c) has no valid leader but already has live units on the map.
---
--- This correctly excludes:
---   • Gaia team (no leader, no AI, no units at game start)
---   • Observer/spectator-occupied team slots (leader is a spectator)
---   • Empty/dead team slots that somehow survived GetTeamList
---
--- Spring.GetPlayerInfo returns: name, active, spectator, teamID, allyTeamID, ...
--- We only need `active` (ret[2]) and `spectator` (ret[3]).
+-- v2.3: isActiveParticipant — simplified and robust.
+-- Admits a team if it is alive and either:
+--   (a) an AI team,
+--   (b) led by a non-spectating human player, or
+--   (c) has live units (fallback for edge cases / mid-game restart).
+-- The `active` flag is intentionally NOT used — it can be false for the
+-- local player in single-player or early LAN joins.
 local function isActiveParticipant(tid)
     local _, leaderID, isDead, isAI = Spring.GetTeamInfo(tid)
 
-    -- Skip teams that have already resigned/died.
-    -- Note: isDead can be nil for some engine versions; treat nil as false.
+    -- Exclude dead/resigned teams.
     if isDead then return false end
 
     -- AI teams are always legitimate participants.
     if isAI then return true end
 
-    -- Human-led team: check the leader is a real, non-spectating player.
-    if leaderID and leaderID >= 0 then
-        local name, active, spectator = Spring.GetPlayerInfo(leaderID)
-        -- `active` is true while the player is connected (not resigned/dropped).
-        -- `spectator` is true for observers who happen to hold a team slot ID.
-        if name and active and not spectator then
-            return true
-        end
-        -- Fall through: leader exists but is spectating or disconnected.
-        -- Still allow the team if it has units (handles AI take-over / late joins).
+    -- Always admit our own team unconditionally.
+    if myTeamID ~= nil and tid == myTeamID then return true end
+
+    -- Exclude Gaia and leaderless slots unless they have units.
+    if not leaderID or leaderID < 0 then
         local units = Spring.GetTeamUnits(tid)
         return units and #units > 0
     end
 
-    -- No valid leader — allow only if there are already units (shouldn't happen
-    -- in normal BAR games but guards against edge cases).
-    local units = Spring.GetTeamUnits(tid)
-    return units and #units > 0
+    -- Human-led: exclude only if the leader is a spectator.
+    local _, _, spectator = Spring.GetPlayerInfo(leaderID)
+    if spectator then
+        local units = Spring.GetTeamUnits(tid)
+        return units and #units > 0
+    end
+
+    return true
 end
 
--- Build the display name for a team slot.
--- FIX v2.2: reads name from GetPlayerInfo rather than just playerID so the
--- returned string is always the in-game player name, not a slot number.
 local function resolveTeamName(tid)
     local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
     if isAI then
@@ -1160,7 +1044,6 @@ local function resolveTeamName(tid)
         return aiName or ("AI "..tid)
     end
     if leaderID and leaderID >= 0 then
-        -- GetPlayerInfo: name, active, spectator, teamID, ...
         local pName = Spring.GetPlayerInfo(leaderID)
         if pName and pName ~= "" then return pName end
     end
@@ -1168,15 +1051,13 @@ local function resolveTeamName(tid)
 end
 
 local function initAllyTeams()
-    -- Detect spectator status fresh each call (player may have joined mid-game).
-    local spec, fullSpec = Spring.GetSpectatingState()
+    -- Re-resolve spectator status and myTeamID on every attempt.
+    local spec = Spring.GetSpectatingState()
     isSpectator = spec or false
+    myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
 
     local tlist
     if isSpectator then
-        -- Spectators enumerate every team slot.
-        -- isActiveParticipant() will filter out Gaia, empty slots, and
-        -- spectator-occupied slots below.
         tlist = Spring.GetTeamList()
     else
         local aid = Spring.GetMyAllyTeamID()
@@ -1187,10 +1068,6 @@ local function initAllyTeams()
 
     if not tlist or #tlist == 0 then return false end
 
-    -- FIX v2.2: use isActiveParticipant() as the sole admission gate.
-    -- The old heuristic (isAI or leaderID >= 0 or units > 0) was too broad —
-    -- it admitted spectator-occupied team slots because leaderID >= 0 is true
-    -- for any player, including pure spectators who hold slot 0 etc.
     local newTeams = {}
     local firstTID = nil
     for _, tid in ipairs(tlist) do
@@ -1214,17 +1091,42 @@ local function initAllyTeams()
         end
     end
 
+    -- Mid-game restart fallback: if isActiveParticipant filtered everything
+    -- (engine state may be partially settled), admit any non-dead team with units.
+    if not next(newTeams) then
+        Spring.Echo("BAR Charts: isActiveParticipant filtered all teams — using unit-presence fallback")
+        for _, tid in ipairs(tlist) do
+            local _, _, isDead = Spring.GetTeamInfo(tid)
+            if not isDead then
+                local units = Spring.GetTeamUnits(tid)
+                if units and #units > 0 then
+                    local r, g, b = Spring.GetTeamColor(tid)
+                    newTeams[tid] = {
+                        teamID          = tid,
+                        playerName      = resolveTeamName(tid),
+                        color           = {r or 1, g or 1, b or 1, 1},
+                        metalIncome     = 0, metalUsage      = 0,
+                        energyIncome    = 0, energyUsage     = 0,
+                        damageDealt     = 0, damageTaken     = 0,
+                        armyValue       = 0, buildPower      = 0,
+                        kills           = 0, losses          = 0,
+                        unitCount       = 0, metalLost       = 0,
+                        buildEfficiency = 0,
+                        metalStall      = 0, totalBP         = 0,
+                    }
+                    initTeamBuffers(tid)
+                    if not firstTID then firstTID = tid end
+                end
+            end
+        end
+    end
+
     if not next(newTeams) then return false end
     allyTeams = newTeams
 
-    -- Set default viewed team.
     if isSpectator then
-        -- Default to first active non-Gaia team found.
         viewedTeamID = firstTID
     else
-        -- Stay on myTeamID if it was already valid.
-        -- myTeamID may be nil only if this is a pure spectator path
-        -- (shouldn't reach here in that case, but guard anyway).
         viewedTeamID = (myTeamID and newTeams[myTeamID]) and myTeamID or firstTID
     end
 
@@ -1238,7 +1140,6 @@ end
 local function collectStats(gameFrame)
     frameCounter = frameCounter + 1
 
-    -- ── Per-second: heavier queries first so values are current when pushed ──
     if frameCounter >= FULL_SCAN_INTERVAL then
         frameCounter = 0
         for tid, stats in pairs(allyTeams) do
@@ -1253,25 +1154,16 @@ local function collectStats(gameFrame)
         end
     end
 
-    -- ── Per-frame: resource reads ─────────────────────────────────────────
-    -- Spring.GetTeamResources returns valid data for:
-    --   • Your own team always
-    --   • All teams in your ally group (shared resource vision)
-    --   • ALL teams when spectating
-    -- For enemy teams in player mode it returns nil — we push the last known
-    -- value (already in stats.*) so the line stays flat rather than zeroing.
     for tid, stats in pairs(allyTeams) do
         local ml, ms, mpull, minc, mexp = Spring.GetTeamResources(tid, "metal")
         local el, es, epull, einc, eexp = Spring.GetTeamResources(tid, "energy")
 
-        -- Only update if we actually got data (non-nil income means the call succeeded)
         if minc ~= nil then
             stats.metalIncome  = minc
             stats.metalUsage   = mexp or 0
             stats.energyIncome = einc or 0
             stats.energyUsage  = eexp or 0
 
-            -- Metal stall detection
             local pull    = mpull or 0
             local expense = mexp  or 0
             if pull > 1 then
@@ -1283,10 +1175,7 @@ local function collectStats(gameFrame)
                 stats.metalStall = 0
             end
         end
-        -- If minc is nil (enemy team in player mode), stats.* keep their last
-        -- value — the ring buffer gets a repeated sample rather than a zero spike.
 
-        -- Push all series for this team every frame
         if history[tid] then
             ringPush(tid, "metalIncome",     stats.metalIncome)
             ringPush(tid, "metalUsage",      stats.metalUsage)
@@ -1302,14 +1191,18 @@ local function collectStats(gameFrame)
         end
     end
 
-    -- ── Update displayed stat-card values (viewed team) ───────────────────
     for _, card in pairs(statCards) do card:update() end
-    -- NOTE: do NOT set chromeDirty here.  Chrome must only be rebuilt on
-    -- structural changes (drag, resize, enable/disable, view switch, viewport
-    -- resize).  Setting it every frame deletes+rebuilds the display list 30×/s
-    -- and was the direct cause of the observed flicker.  Data-range scaling for
-    -- the grid labels is recomputed live in computeRange() every DrawScreen call
-    -- without touching the display list, so the grid always reflects current data.
+
+    -- Trigger a chrome rebuild the first time any chart transitions from
+    -- no-data to has-data, so the grid and axis labels appear correctly.
+    if not chromeDirty then
+        for _, chart in pairs(charts) do
+            if chart.enabled and chart._range == nil and chart:hasData() then
+                chromeDirty = true
+                break
+            end
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -1320,65 +1213,48 @@ local function buildChartsAndCards()
     charts    = {}
     statCards = {}
 
-    -- ── Line Charts ────────────────────────────────────────────────────────
-    -- Metal and energy: dynamic scaling — the gap between income and usage
-    -- lines is what matters; zero-flooring would collapse the signal at scale.
     charts.metal = Chart.new("chart-metal", "METAL", "⚙",
         vsx-350, vsy-230, "dual", {
             { label="Income", color=COLOR.accent,  seriesKey="metalIncome"  },
             { label="Usage",  color=COLOR.accent2, seriesKey="metalUsage"   },
-        }, false, false)
+        })
 
     charts.energy = Chart.new("chart-energy", "ENERGY", "⚡",
         vsx-660, vsy-230, "dual", {
             { label="Income", color=COLOR.accent,  seriesKey="energyIncome" },
             { label="Usage",  color=COLOR.accent2, seriesKey="energyUsage"  },
-        }, false, false)
+        })
 
-    -- Damage: dynamic scaling — relative shape and divergence between dealt/taken
-    -- is the key signal; absolute distance from zero is not meaningful here.
     charts.damage = Chart.new("chart-damage", "DAMAGE", "✕",
         vsx-970, vsy-230, "dual", {
             { label="Dealt", color=COLOR.success, seriesKey="damageDealt"  },
             { label="Taken", color=COLOR.danger,  seriesKey="damageTaken"  },
-        }, false, false)
+        })
 
-    -- Army value: zero-floored — floating baseline makes a small dip look like
-    -- a catastrophic collapse; the true proportion matters.
     charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙",
         vsx-350, vsy-430, "single", {
             { label="Value", color=COLOR.accent, seriesKey="armyValue" },
-        }, false, true)
+        })
 
-    -- K/D ratio: zero-floored — ratio is always non-negative and the chart
-    -- should read clearly against a stable zero baseline.
     charts.kd = Chart.new("chart-kd", "K/D", "✕",
         vsx-660, vsy-430, "ratio", {
-            { label="Ratio", color=COLOR.success, seriesKey="kills",
-              isDerived = true,
-            },
-        }, false, true)
+            { label="Ratio", color=COLOR.success, seriesKey="kills" },
+        })
 
-    -- Build efficiency: chartType="percent" already forces 0-100, so zeroFloor
-    -- is redundant but set for clarity and forward-compatibility.
     charts.buildEfficiency = Chart.new("chart-build-efficiency",
         "BUILDER EFFICIENCY", "🔧", vsx-970, vsy-430, "percent", {
             { label="Efficiency", color=COLOR.gold, seriesKey="buildEfficiency" },
-        }, false, true)
+        })
 
-    -- Multi-team army and build power: zero-floored — comparing absolute team
-    -- strengths requires a shared zero baseline; a floating axis makes a weaker
-    -- team look equal to a stronger one just because they share the same view.
     charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",
-        vsx-1280, vsy-430, "multi", {}, true, true)
+        vsx-1280, vsy-430, "multi", {}, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧",
-        vsx-1280, vsy-230, "multi", {}, true, true)
+        vsx-1280, vsy-230, "multi", {}, true)
 
     -- K/D chart: override getSamples to compute ratio from kills+losses buffers
     do
         charts.kd.getSamples = function(self, i)
-            -- Sample kills and losses independently then compute per-point ratio
-            local tid     = viewedTeamID
+            local tid = viewedTeamID
             if not tid or not history[tid] then return {} end
             local kPts = ringSample(tid, "kills",  RENDER_POINTS)
             local lPts = ringSample(tid, "losses", RENDER_POINTS)
@@ -1412,14 +1288,14 @@ local function buildChartsAndCards()
         end
     end
 
-    statCards["card-army-value"]       = StatCard.new("card-army-value",       "ARMY VALUE", "⚙",  col1X, cardY,                COLOR.accent,  vStat("armyValue"))
-    statCards["card-unit-count"]       = StatCard.new("card-unit-count",       "UNITS",      "▣",  col2X, cardY,                COLOR.accent,  vStat("unitCount"))
-    statCards["card-kills"]            = StatCard.new("card-kills",            "KILLS",      "✕",  col1X, cardY-cardStep,       COLOR.success, vStat("kills"))
-    statCards["card-losses"]           = StatCard.new("card-losses",           "LOSSES",     "↓",  col2X, cardY-cardStep,       COLOR.danger,  vStat("losses"))
-    statCards["card-dmg-dealt"]        = StatCard.new("card-dmg-dealt",        "DMG DEALT",  "▲",  col1X, cardY-cardStep*2,     COLOR.success, vStat("damageDealt"))
-    statCards["card-dmg-taken"]        = StatCard.new("card-dmg-taken",        "DMG TAKEN",  "▼",  col2X, cardY-cardStep*2,     COLOR.danger,  vStat("damageTaken"))
-    statCards["card-metal-lost"]       = StatCard.new("card-metal-lost",       "METAL LOST", "◆",  col1X, cardY-cardStep*3,     COLOR.gold,    vStat("metalLost"))
-    statCards["card-build-efficiency"] = StatCard.new("card-build-efficiency", "BUILD EFF",  "🔧", col2X, cardY-cardStep*3,     COLOR.gold,    vStat("buildEfficiency"))
+    statCards["card-army-value"]       = StatCard.new("card-army-value",       "ARMY VALUE", "⚙",  col1X, cardY,            COLOR.accent,  vStat("armyValue"))
+    statCards["card-unit-count"]       = StatCard.new("card-unit-count",       "UNITS",      "▣",  col2X, cardY,            COLOR.accent,  vStat("unitCount"))
+    statCards["card-kills"]            = StatCard.new("card-kills",            "KILLS",      "✕",  col1X, cardY-cardStep,   COLOR.success, vStat("kills"))
+    statCards["card-losses"]           = StatCard.new("card-losses",           "LOSSES",     "↓",  col2X, cardY-cardStep,   COLOR.danger,  vStat("losses"))
+    statCards["card-dmg-dealt"]        = StatCard.new("card-dmg-dealt",        "DMG DEALT",  "▲",  col1X, cardY-cardStep*2, COLOR.success, vStat("damageDealt"))
+    statCards["card-dmg-taken"]        = StatCard.new("card-dmg-taken",        "DMG TAKEN",  "▼",  col2X, cardY-cardStep*2, COLOR.danger,  vStat("damageTaken"))
+    statCards["card-metal-lost"]       = StatCard.new("card-metal-lost",       "METAL LOST", "◆",  col1X, cardY-cardStep*3, COLOR.gold,    vStat("metalLost"))
+    statCards["card-build-efficiency"] = StatCard.new("card-build-efficiency", "BUILD EFF",  "🔧", col2X, cardY-cardStep*3, COLOR.gold,    vStat("buildEfficiency"))
 end
 
 -------------------------------------------------------------------------------
@@ -1428,7 +1304,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.2",
+        version           = "2.3",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         charts            = {},
@@ -1500,9 +1376,6 @@ end
 -- PLAYER VIEW SWITCHING
 -------------------------------------------------------------------------------
 
--- Switches the displayed player.  O(1) pointer swap + multi-team series refresh.
--- FIX v2.2: now also refreshes multiTeam series so they never point at stale
--- teamIDs, and always marks chrome dirty so the title area updates immediately.
 local function switchView(targetTeamID)
     if not allyTeams[targetTeamID] then
         Spring.Echo("BAR Charts: switchView FAILED — teamID "
@@ -1522,7 +1395,6 @@ local function switchView(targetTeamID)
 
     viewedTeamID = targetTeamID
 
-    -- Refresh multi-team series in case the roster changed since last init.
     if charts.allyArmy       then charts.allyArmy:rebuildMultiTeamSeries()       end
     if charts.allyBuildPower then charts.allyBuildPower:rebuildMultiTeamSeries() end
 
@@ -1533,7 +1405,6 @@ local function switchView(targetTeamID)
         viewedTeamID, allyTeams[viewedTeamID].playerName))
 end
 
--- Look up team by player name (case-insensitive partial match).
 local function findTeamByName(nameQuery)
     local q = string.lower(nameQuery)
     for tid, stats in pairs(allyTeams) do
@@ -1545,78 +1416,91 @@ local function findTeamByName(nameQuery)
 end
 
 -------------------------------------------------------------------------------
+-- DIAGNOSTIC (used during ready-wait to log engine state)
+-------------------------------------------------------------------------------
+
+local function debugInitState()
+    Spring.Echo("=== BAR Charts Init Diagnostic ===")
+    local spec, fullSpec = Spring.GetSpectatingState()
+    local myTID  = Spring.GetMyTeamID()
+    local myATID = Spring.GetMyAllyTeamID()
+    Spring.Echo(string.format("  spec=%s fullSpec=%s myTeamID=%s myAllyTeamID=%s",
+        tostring(spec), tostring(fullSpec), tostring(myTID), tostring(myATID)))
+
+    local tlistAll  = Spring.GetTeamList()
+    local tlistAlly = myATID and Spring.GetTeamList(myATID) or {}
+    Spring.Echo(string.format("  GetTeamList() all=%d  ally=%d",
+        tlistAll and #tlistAll or 0, tlistAlly and #tlistAlly or 0))
+
+    for _, tid in ipairs(tlistAll or {}) do
+        local _, leaderID, isDead, isAI = Spring.GetTeamInfo(tid)
+        local units = Spring.GetTeamUnits(tid) or {}
+        local pName, pActive, pSpec = "n/a", "n/a", "n/a"
+        if leaderID and leaderID >= 0 then
+            local a, b, c = Spring.GetPlayerInfo(leaderID)
+            pName = tostring(a); pActive = tostring(b); pSpec = tostring(c)
+        end
+        Spring.Echo(string.format(
+            "  tid=%-3d  leader=%-3s  dead=%-5s  ai=%-5s  units=%-4d  pName=%-16s  pActive=%-5s  pSpec=%s  admit=%s",
+            tid, tostring(leaderID), tostring(isDead), tostring(isAI),
+            #units, pName, pActive, pSpec, tostring(isActiveParticipant(tid))))
+    end
+    Spring.Echo("=== end diagnostic ===")
+end
+
+-------------------------------------------------------------------------------
 -- INITIALIZE
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2.2: Initialize")
-    vsx, vsy     = Spring.GetViewGeometry()
+    Spring.Echo("BAR Charts v2.3: Initialize")
+    vsx, vsy = Spring.GetViewGeometry()
 
-    -- Detect spectator status up-front.
     local spec = Spring.GetSpectatingState()
-    isSpectator = spec or false
-    myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
-    viewedTeamID = myTeamID   -- nil for spectators until initAllyTeams resolves
+    isSpectator  = spec or false
+    myTeamID     = isSpectator and nil or Spring.GetMyTeamID()
+    viewedTeamID = myTeamID
 
-    chartsReady  = false
-    frameCounter = 0
+    chartsReady           = false
+    frameCounter          = 0
     chartsReadyWaitFrames = 0
-    allyTeams    = {}
-    history      = {}
-    histHead     = {}
-    histFull     = {}
-    builderUnits = {}
-    buildEffState = {}
-    maxMetalUseCache = {}
-    resetBuildEffForTeam(nil)   -- clears all per-team windows
+    allyTeams             = {}
+    history               = {}
+    histHead              = {}
+    histFull              = {}
+    builderUnits          = {}
+    buildEffState         = {}
+    maxMetalUseCache      = {}
+    resetBuildEffForTeam(nil)
     buildChartsAndCards()
     local chartCfg, cardCfg = loadConfig()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.2: Initialized"
-        .. (isSpectator and " (SPECTATOR — active teams only)" or "")
+    Spring.Echo("BAR Charts v2.3: Initialized"
+        .. (isSpectator and " (SPECTATOR)" or "")
         .. ", waiting for team data…")
 end
 
 -------------------------------------------------------------------------------
--- UPDATE (wall-clock tick — spectator camera follow)
+-- UPDATE
 -------------------------------------------------------------------------------
 
--- pollLocalTeam: called every Update() tick.
---
--- Spring.GetSpectatingState() returns: bool spectating, bool fullView, bool fullSelect
--- There is NO spectatedPlayerID in the return — that signature does not exist
--- in the Recoil/BAR engine build.
---
--- The correct primitive is Spring.GetLocalTeamID(), which maps to gu->myTeam
--- in the engine.  For a spectator in BAR this value updates immediately when
--- you click a player name in the player list, so polling it every Update()
--- tick gives us instant view-switch detection with no extra API calls.
 local function pollLocalTeam()
     if not chartsReady then return end
 
     local teamID = Spring.GetLocalTeamID()
     if teamID == nil then return end
-    if teamID == viewedTeamID then return end   -- no change, common case
+    if teamID == viewedTeamID then return end
 
-    -- Log the raw engine value on every transition.
     Spring.Echo(string.format(
         "BAR Charts [poll] GetLocalTeamID=%d  (current viewedTeamID=%s)",
         teamID, tostring(viewedTeamID)))
 
     if not allyTeams[teamID] then
-        -- Not in our tracked set.  Can happen if the engine returns a Gaia or
-        -- spectator-slot teamID, or if the ready-wait cycle hasn't run yet.
         Spring.Echo(string.format(
-            "BAR Charts [poll] teamID=%d NOT in tracked set — ignoring (tracked: %s)",
-            teamID,
-            (function()
-                local ids = {}
-                for tid in pairs(allyTeams) do ids[#ids+1] = tostring(tid) end
-                table.sort(ids)
-                return table.concat(ids, ", ")
-            end)()))
+            "BAR Charts [poll] teamID=%d NOT in tracked set — ignoring",
+            teamID))
         return
     end
 
@@ -1629,49 +1513,36 @@ local function pollLocalTeam()
 
     viewedTeamID = teamID
     chromeDirty  = true
-
-    Spring.Echo(string.format(
-        "BAR Charts [poll] viewedTeamID is now %d ('%s')  chromeDirty=true",
-        viewedTeamID, allyTeams[viewedTeamID].playerName))
 end
 
 function widget:Update(dt)
     pollLocalTeam()
-    -- Chrome is rebuilt at the top of DrawScreen when chromeDirty is true.
-    -- Do NOT rebuild here — doing so and in DrawScreen deletes+recreates the
-    -- display list twice in the same render frame, causing flicker.
 end
 
 -------------------------------------------------------------------------------
--- GAME FRAME (pause-safe, primary driver)
+-- GAME FRAME
 -------------------------------------------------------------------------------
 
 function widget:GameFrame(n)
     if not chartsReady then
         chartsReadyWaitFrames = chartsReadyWaitFrames + 1
         if chartsReadyWaitFrames >= READY_WAIT_FRAMES then
-            chartsReadyWaitFrames = 0
-            -- Re-check spectator status each cycle (player may have joined).
-            local spec = Spring.GetSpectatingState()
-            isSpectator = spec or false
-            myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
-
+            chartsReadyWaitFrames = 0  -- always reset so we retry every 3s until success
+            debugInitState()
             if initAllyTeams() then
                 charts.allyArmy:rebuildMultiTeamSeries()
                 charts.allyBuildPower:rebuildMultiTeamSeries()
                 seedArmyValues()
-                seedBuildPower()    -- seeds builderUnits[tid] for every tracked team
-                seedUnitCount()     -- seeds unitCount for every tracked team
+                seedBuildPower()
+                seedUnitCount()
                 chartsReady  = true
                 frameCounter = 0
                 chromeDirty  = true
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v2.2: Ready — %s, buffering %d active participant team(s)",
+                    "BAR Charts v2.3: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
-                -- Log the initial tracked team roster so it's easy to verify
-                -- which teams were admitted by isActiveParticipant().
                 Spring.Echo("BAR Charts: Tracked teams:")
                 for tid, stats in pairs(allyTeams) do
                     Spring.Echo(string.format("  teamID=%-3d  '%s'%s",
@@ -1683,9 +1554,6 @@ function widget:GameFrame(n)
         return
     end
 
-    -- Sample build efficiency for every tracked team, not just myTeamID.
-    -- Each team has its own tick counter and rolling window so they are
-    -- completely independent — switching view never mixes data between teams.
     for tid in pairs(allyTeams) do
         ensureBuildEffState(tid)
         local s = buildEffState[tid]
@@ -1714,12 +1582,12 @@ function widget:GameStart()
     histHead              = {}
     histFull              = {}
     for _, stats in pairs(allyTeams) do
-        stats.armyValue = 0; stats.unitCount      = 0
-        stats.kills     = 0; stats.losses         = 0
-        stats.metalLost = 0; stats.damageDealt    = 0
-        stats.damageTaken = 0; stats.buildEfficiency = 0
-        stats.metalStall  = 0; stats.totalBP      = 0
-        stats.buildPower  = 0
+        stats.armyValue       = 0; stats.unitCount      = 0
+        stats.kills           = 0; stats.losses         = 0
+        stats.metalLost       = 0; stats.damageDealt    = 0
+        stats.damageTaken     = 0; stats.buildEfficiency = 0
+        stats.metalStall      = 0; stats.totalBP        = 0
+        stats.buildPower      = 0
     end
     chromeDirty = true
     Spring.Echo("BAR Charts v2.3: Game started")
@@ -1857,7 +1725,6 @@ end
 -------------------------------------------------------------------------------
 
 function widget:TextCommand(command)
-    -- /barcharts view <name or teamID>
     if command:sub(1, 14) == "barcharts view" then
         local arg = command:sub(16)
         if arg and #arg > 0 then
@@ -1873,9 +1740,8 @@ function widget:TextCommand(command)
                 end
             end
         else
-            -- List available active teams
             Spring.Echo("BAR Charts: Active participant teams"
-                .. (isSpectator and " (spectator — all active teams)" or " (allies)") .. ":")
+                .. (isSpectator and " (spectator)" or " (allies)") .. ":")
             for tid, stats in pairs(allyTeams) do
                 local marker = (tid == viewedTeamID) and " ◀ viewing" or ""
                 local mine   = (myTeamID and tid == myTeamID) and " (you)" or ""
@@ -1894,7 +1760,7 @@ function widget:TextCommand(command)
     elseif command == "barcharts edit" then
         onToggleClick(nil); return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2.2 Debug ===")
+        Spring.Echo("=== BAR Charts v2.3 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
@@ -1912,16 +1778,9 @@ function widget:TextCommand(command)
                 stats.metalIncome, stats.metalUsage,
                 stats.armyValue, tostring(full), head))
         end
-        -- Also report zeroFloor status per chart for easy verification
-        Spring.Echo("-- CHART ZERO-FLOOR FLAGS --")
-        for id, chart in pairs(charts) do
-            Spring.Echo(string.format("  %-30s  zeroFloor=%s", id, tostring(chart.zeroFloor)))
-        end
         return true
     elseif command == "barcharts viewdebug" then
-        -- Dumps the last 5 sample values from each series for the currently
-        -- viewed team so you can verify the ring buffer is actually switching.
-        local tid = viewedTeamID
+        local tid   = viewedTeamID
         local stats = allyTeams[tid]
         Spring.Echo(string.format("=== ViewDebug: team %s (%s) ===",
             tostring(tid), stats and stats.playerName or "?"))
@@ -1931,7 +1790,6 @@ function widget:TextCommand(command)
         end
         for _, key in ipairs(SERIES_KEYS) do
             local startIdx, count = ringRange(tid, key)
-            -- Read last 5 values
             local vals = {}
             local buf  = history[tid][key]
             for i = math.max(1, count-4), count do
@@ -1973,6 +1831,9 @@ function widget:TextCommand(command)
         Spring.Echo(string.format("  total=%d active=%d instant=%.1f%% rolling=%.1f%%",
             total, active, inst, stats and stats.buildEfficiency or 0))
         return true
+    elseif command == "barcharts diag" then
+        debugInitState()
+        return true
     end
     return false
 end
@@ -1985,5 +1846,5 @@ function widget:Shutdown()
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2.2: Shutdown")
+    Spring.Echo("BAR Charts v2.3: Shutdown")
 end
